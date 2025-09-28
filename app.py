@@ -1,177 +1,217 @@
 import streamlit as st
 import pandas as pd
-import unicodedata, re, zipfile
-from io import BytesIO
+from pathlib import Path
+import re, unicodedata
 from urllib.parse import quote_plus
 from streamlit_folium import st_folium
 import folium
 from folium.plugins import MarkerCluster
 
-st.set_page_config(page_title="Carte entreprises (NAF) + couches", layout="wide")
-st.title("🗺️ Carte entreprises par NAF + couches (ex. fromageries, méthaniseurs)")
+# ---------- Config ----------
+st.set_page_config(page_title="Carte entreprises par NAF (départements + méthaniseurs)", layout="wide")
+st.title("🗺️ Carte entreprises par NAF — sélection par département + couche Méthaniseurs")
 
-# ---------- Helpers ----------
-def _norm(s:str):
+ROOT = Path(__file__).parent
+DIR_ENT = ROOT / "data" / "entreprises"
+DIR_METH = ROOT / "data" / "methaniseurs"
+METH_FILE = DIR_METH / "methaniseurs.csv"   # optionnel
+
+# Colonnes SIRENE (selon ton fichier)
+COLS = {
+    "siret": "siret",
+    "etat": "etatAdministratifEtablissement",
+    "naf": "activitePrincipaleEtablissement",
+    "enseigne1": "enseigne1Etablissement",
+    "denom": "denominationUsuelleEtablissement",
+    "lon": "longitude",
+    "lat": "latitude",
+    "adresse": "geo_adresse",
+    "cp": "codePostalEtablissement",
+    "commune": "libelleCommuneEtablissement",
+    "siege": "etablissementSiege",
+}
+
+# ---------- Utils ----------
+def _read_csv_auto(path):
+    # tente séparateur auto, puis ";" si échec (certains exports)
+    try:
+        return pd.read_csv(path, sep=None, engine="python", low_memory=False)
+    except Exception:
+        return pd.read_csv(path, sep=";", low_memory=False)
+
+def _norm(s: str):
     if not isinstance(s, str): return ""
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    s = s.lower()
-    return re.sub(r"[^a-z0-9_]", "", s)
-
-def _find_col(df, candidates):
-    normmap = {_norm(c): c for c in df.columns}
-    for cand in candidates:
-        if cand in normmap:
-            return normmap[cand]
-    return None
-
-def _read_csv_auto(filelike):
-    # détecte ; ou , automatiquement
-    try:
-        return pd.read_csv(filelike, sep=None, engine="python", low_memory=False)
-    except Exception:
-        try:
-            filelike.seek(0)
-        except Exception:
-            pass
-        return pd.read_csv(filelike, sep=";", low_memory=False)
-
-@st.cache_data(show_spinner=False)
-def load_many(files):
-    frames=[]
-    for f in files:
-        name = getattr(f, "name", "upload")
-        if name.lower().endswith(".zip"):
-            z = zipfile.ZipFile(f)
-            for n in z.namelist():
-                if n.lower().endswith(".csv"):
-                    with z.open(n) as zf:
-                        df = _read_csv_auto(zf)
-                        df["__source__"] = n
-                        frames.append(df)
-        else:
-            df = _read_csv_auto(f)
-            df["__source__"] = name
-            frames.append(df)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    return re.sub(r"[^0-9A-Za-z ]+", " ", s).strip()
 
 def build_pj_link(nom, adresse, cp, commune):
-    # Lien recherche PagesJaunes (approx, mais efficace)
     terms = " ".join([str(x) for x in [nom, adresse, cp, commune] if x])
     return f"https://www.pagesjaunes.fr/recherche/{quote_plus(terms)}"
 
 def build_gmaps_link(lat, lon, nom=None, adresse=None):
     if pd.notna(lat) and pd.notna(lon):
         return f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-    # fallback sur recherche texte
     q = " ".join([str(x) for x in [nom, adresse] if x])
     return f"https://www.google.com/maps/search/?api=1&query={quote_plus(q)}"
 
-# ---------- UI: chargement des données entreprises ----------
-st.subheader("1) Charge tes CSV d’entreprises (par département ou ZIP)")
-st.caption("Astuce : si possible, utilise des CSV **déjà géolocalisés** (colonnes latitude/longitude).")
-uploads = st.file_uploader("Dépose plusieurs CSV ou un ZIP", type=["csv","zip"], accept_multiple_files=True)
+# ---------- Découverte des fichiers ----------
+@st.cache_data(show_spinner=False)
+def list_dept_files():
+    files = sorted(DIR_ENT.glob("geo_siret_*.csv"))
+    out = []
+    for f in files:
+        m = re.search(r"geo_siret_([0-9]{2}|2A|2B)", f.name, re.IGNORECASE)
+        code = m.group(1).upper() if m else f.stem
+        out.append((code, f))
+    return out
 
-# ---------- UI: couche optionnelle méthaniseurs ----------
-st.subheader("2) (Optionnel) Ajoute un CSV de méthaniseurs")
-meth_file = st.file_uploader("CSV unique ou ZIP pour 'Méthaniseurs'", type=["csv","zip"], accept_multiple_files=False)
+# ---------- Chargement multi-départements ----------
+@st.cache_data(show_spinner=True)
+def load_departments(selected_deps):
+    frames = []
+    for dep_code, f in list_dept_files():
+        if dep_code in selected_deps:
+            df = _read_csv_auto(f)
+            df["__dep__"] = dep_code
+            df["__source__"] = f.name
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
-if not uploads:
-    st.info("➡️ Commence par déposer tes CSV d’entreprises.")
+# ---------- Charge méthaniseurs (optionnel) ----------
+@st.cache_data(show_spinner=False)
+def load_methaniseurs():
+    if not METH_FILE.exists():
+        return None
+    dfm = _read_csv_auto(METH_FILE)
+    # colonnes attendues: nom, adresse, latitude, longitude (tolère variantes simples)
+    def find_col(cands):
+        for c in cands:
+            if c in dfm.columns: return c
+        return None
+    c_lat = find_col(["latitude","lat","y"])
+    c_lon = find_col(["longitude","lon","x"])
+    c_nom = find_col(["nom","name","denomination","enseigne"])
+    c_addr= find_col(["adresse","address","geo_adresse"])
+    if not c_lat or not c_lon:
+        return None
+    dfm["lat"] = pd.to_numeric(dfm[c_lat].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    dfm["lon"] = pd.to_numeric(dfm[c_lon].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    dfm = dfm[dfm["lat"].notna() & dfm["lon"].notna()].copy()
+    if c_nom and "nom" not in dfm.columns: dfm.rename(columns={c_nom:"nom"}, inplace=True)
+    if c_addr and "adresse" not in dfm.columns: dfm.rename(columns={c_addr:"adresse"}, inplace=True)
+    dfm["gmaps_url"] = dfm.apply(lambda r: build_gmaps_link(r.get("lat"), r.get("lon"), r.get("nom"), r.get("adresse")), axis=1)
+    keep = [c for c in ["nom","adresse","lat","lon","gmaps_url"] if c in dfm.columns]
+    return dfm[keep].copy()
+
+# ---------- UI: Départements ----------
+deps = list_dept_files()
+dep_codes = [d for d,_ in deps]
+if not deps:
+    st.error("Aucun fichier trouvé dans data/entreprises/ (ex: geo_siret_01.csv).")
     st.stop()
 
-df_raw = load_many(uploads)
-st.write(f"📥 Données entreprises chargées : **{len(df_raw):,} lignes**")
-
-# ---------- Mapping de colonnes ----------
-col_naf  = _find_col(df_raw, ["activiteprincipaleetablissement","naf","ape"])
-col_lat  = _find_col(df_raw, ["latitude","lat","geo_lat","y"])
-col_lon  = _find_col(df_raw, ["longitude","lon","geo_lon","x"])
-col_name = _find_col(df_raw, ["denominationunitelegale","denomination","enseigne1etablissement","enseigne","nom"])
-col_addr = _find_col(df_raw, ["geo_adresse","adresseetablissement","adresse"])
-col_cp   = _find_col(df_raw, ["codepostaletablissement","code_postal","cp"])
-col_com  = _find_col(df_raw, ["libellecommuneetablissement","commune","ville"])
-col_siret= _find_col(df_raw, ["siret"])
-col_etat = _find_col(df_raw, ["etatadministratifetablissement","etat"])
-
-if not col_lat or not col_lon:
-    st.error("❌ Colonnes latitude/longitude introuvables. Fourni des CSV géolocalisés ou ajoute un géocodage en amont.")
-    st.stop()
-
-# ---------- Filtre 'actifs' ----------
-df = df_raw.copy()
-if col_etat:
-    df = df[df[col_etat].astype(str).str.upper().str.startswith("A")]
-
-# ---------- UI NAF : menu déroulant multi-sélection ----------
-if col_naf:
-    naf_series = df[col_naf].astype(str).str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
-    codes_naf_disponibles = sorted(naf_series.unique())
-    # pré-selectionne 10.51C et 47.29Z si présents
-    preselect = [c for c in ["10.51C","47.29Z","1051C","4729Z"] if c in codes_naf_disponibles]
-    sel = st.multiselect("3) Choisis un ou plusieurs codes NAF à afficher",
-                         options=codes_naf_disponibles,
-                         default=preselect or codes_naf_disponibles[:10])
-    if sel:
-        df = df[naf_series.isin(sel)]
+st.subheader("1) Sélection des départements")
+col1, col2 = st.columns([2,1])
+with col1:
+    all_deps = st.checkbox("Sélectionner tous les départements", value=True)
+if all_deps:
+    selected_deps = dep_codes
 else:
-    st.warning("⚠️ Colonne NAF non trouvée. Tous les enregistrements seront affichés.")
+    selected_deps = st.multiselect("Choisis un ou plusieurs départements", options=dep_codes, default=dep_codes[:5])
 
-# ---------- Normalisation coords ----------
-lat_raw = df[col_lat].astype(str).str.replace(",", ".", regex=False)
-lon_raw = df[col_lon].astype(str).str.replace(",", ".", regex=False)
-df["_lat"] = pd.to_numeric(lat_raw, errors="coerce")
-df["_lon"] = pd.to_numeric(lon_raw, errors="coerce")
-df = df.dropna(subset=["_lat","_lon"])
+# ---------- Chargement ----------
+df_raw = load_departments(selected_deps)
+st.write(f"📥 Lignes chargées: **{len(df_raw):,}** (dep: {len(selected_deps)})")
 
-# ---------- Dataframe final entreprises ----------
-keep_cols = [col_siret,col_name,col_addr,col_cp,col_com,col_naf,col_lat,col_lon,"__source__"]
-keep = [c for c in keep_cols if c]
-ent = df[keep].rename(columns={
-    col_siret:"siret", col_name:"nom", col_addr:"adresse", col_cp:"cp",
-    col_com:"commune", col_naf:"naf", col_lat:"lat", col_lon:"lon"
-}).copy()
-ent["pj_url"] = ent.apply(lambda r: build_pj_link(r.get("nom"), r.get("adresse"), r.get("cp"), r.get("commune")), axis=1)
-ent["gmaps_url"] = ent.apply(lambda r: build_gmaps_link(r.get("lat"), r.get("lon"), r.get("nom"), r.get("adresse")), axis=1)
+# ---------- Garde colonnes utiles ----------
+missing = [c for c in COLS.values() if c not in df_raw.columns]
+if missing:
+    st.warning("⚠️ Colonnes manquantes (vérifie l’export): " + ", ".join(missing))
+
+# Nettoyage état administratif
+df = df_raw.copy()
+if COLS["etat"] in df.columns:
+    df = df[df[COLS["etat"]].astype(str).str.upper().str.startswith("A")]  # "A" = actif
+
+# Champs d'affichage
+def coalesce_name(row):
+    vals = [row.get(COLS["denom"]), row.get(COLS["enseigne1"])]
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+# NAF list + filtre
+if COLS["naf"] in df.columns:
+    naf_clean = df[COLS["naf"]].astype(str).str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
+    codes_naf = sorted(naf_clean.unique())
+    st.subheader("2) Codes NAF")
+    defaults = [c for c in ["10.51C","47.29Z","1051C","4729Z"] if c in codes_naf]
+    naf_select = st.multiselect("Choisis un ou plusieurs codes NAF à afficher",
+                                options=codes_naf,
+                                default=defaults or codes_naf[:10])
+    if naf_select:
+        df = df[naf_clean.isin(naf_select)]
+else:
+    st.info("Colonne NAF introuvable — aucun filtre NAF appliqué.")
+    naf_select = []
+
+# Optional: si tu veux ne garder que les sièges
+only_siege = st.checkbox("Ne garder que les sièges (etablissementSiege=1)", value=False)
+if only_siege and COLS["siege"] in df.columns:
+    df = df[df[COLS["siege"]].astype(str).isin(["1","True","true","O","Oui"])]
+
+# Coordonnées
+if COLS["lat"] not in df.columns or COLS["lon"] not in df.columns:
+    st.error("Colonnes latitude/longitude absentes. Tes CSV doivent être géolocalisés.")
+    st.stop()
+
+df["lat"] = pd.to_numeric(df[COLS["lat"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+df["lon"] = pd.to_numeric(df[COLS["lon"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+df = df[df["lat"].notna() & df["lon"].notna()].copy()
+
+# Dataframe final pour export & carte
+ent = pd.DataFrame({
+    "siret": df.get(COLS["siret"], ""),
+    "nom": df.apply(coalesce_name, axis=1),
+    "adresse": df.get(COLS["adresse"], ""),
+    "cp": df.get(COLS["cp"], "").astype(str),
+    "commune": df.get(COLS["commune"], ""),
+    "naf": df.get(COLS["naf"], ""),
+    "lat": df["lat"],
+    "lon": df["lon"],
+    "__dep__": df["__dep__"],
+    "__source__": df["__source__"],
+})
+
+# Liens
+ent["pj_url"] = ent.apply(lambda r: build_pj_link(r["nom"], r["adresse"], r["cp"], r["commune"]), axis=1)
+ent["gmaps_url"] = ent.apply(lambda r: build_gmaps_link(r["lat"], r["lon"], r["nom"], r["adresse"]), axis=1)
 
 st.success(f"✅ Entreprises à afficher : **{len(ent):,}**")
 
-# ---------- (Optionnel) Méthaniseurs ----------
-meth = None
-if meth_file:
-    dfm = load_many([meth_file])
-    col_lat_m = _find_col(dfm, ["latitude","lat","y"])
-    col_lon_m = _find_col(dfm, ["longitude","lon","x"])
-    name_m    = _find_col(dfm, ["nom","name","enseigne","denomination"])
-    addr_m    = _find_col(dfm, ["adresse","address","geo_adresse"])
-    if col_lat_m and col_lon_m:
-        latm = pd.to_numeric(dfm[col_lat_m].astype(str).str.replace(",", ".", regex=False), errors="coerce")
-        lonm = pd.to_numeric(dfm[col_lon_m].astype(str).str.replace(",", ".", regex=False), errors="coerce")
-        dfm = dfm[latm.notna() & lonm.notna()].copy()
-        dfm["lat"] = latm
-        dfm["lon"] = lonm
-        dfm["nom"] = dfm.get(name_m, "")
-        dfm["adresse"] = dfm.get(addr_m, "")
-        dfm["gmaps_url"] = dfm.apply(lambda r: build_gmaps_link(r.get("lat"), r.get("lon"), r.get("nom"), r.get("adresse")), axis=1)
-        meth = dfm[["nom","adresse","lat","lon","gmaps_url","__source__"]].copy()
-        st.info(f"➕ Couche 'Méthaniseurs' chargée : **{len(meth):,}** points")
-    else:
-        st.warning("⚠️ Méthaniseurs : colonnes lat/lon introuvables → couche ignorée.")
+# ---------- Couche Méthaniseurs ----------
+st.subheader("3) Couche optionnelle : Méthaniseurs")
+show_meth = st.checkbox("Afficher la couche 'Méthaniseurs' si data/methaniseurs/methaniseurs.csv est présent", value=METH_FILE.exists())
+meth = load_methaniseurs() if show_meth else None
+if show_meth and meth is None:
+    st.info("Aucun fichier valide trouvé pour les méthaniseurs (attendu: nom, adresse, latitude, longitude).")
 
 # ---------- Carte ----------
-st.subheader("4) Carte interactive")
+st.subheader("4) Carte")
 m = folium.Map(location=[46.6, 2.4], zoom_start=6, tiles="OpenStreetMap")
-
-# Cluster entreprises
 cluster_ent = MarkerCluster(name="Entreprises").add_to(m)
+
 for _, r in ent.iterrows():
-    popup = f"""<b>{r.get('nom','')}</b><br>
-    {r.get('adresse','') or ''}<br>{(str(r.get('cp',''))+' '+str(r.get('commune',''))).strip()}<br>
-    SIRET: {r.get('siret','') or ''}<br>NAF: {r.get('naf','') or ''}<br>
-    <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a> | 
-    <a href="{r.get('pj_url','')}" target="_blank">PagesJaunes</a>
-    """
+    popup = f"""<b>{_norm(r.get('nom',''))}</b><br>
+    {r.get('adresse','') or ''}<br>
+    {(r.get('cp','') or '')} {(r.get('commune','') or '')}<br>
+    Dép: {r.get('__dep__','')} | SIRET: {r.get('siret','') or ''}<br>
+    NAF: {r.get('naf','') or ''}<br>
+    <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a> |
+    <a href="{r.get('pj_url','')}" target="_blank">PagesJaunes</a>"""
     try:
         folium.Marker([float(r["lat"]), float(r["lon"])],
                       popup=popup,
@@ -179,14 +219,12 @@ for _, r in ent.iterrows():
     except Exception:
         continue
 
-# Cluster méthaniseurs
 if meth is not None and len(meth):
     cluster_m = MarkerCluster(name="Méthaniseurs").add_to(m)
     for _, r in meth.iterrows():
-        popup = f"""<b>{r.get('nom','(Méthaniseur)')}</b><br>
+        popup = f"""<b>{_norm(str(r.get('nom','Méthaniseur')))}</b><br>
         {r.get('adresse','') or ''}<br>
-        <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a>
-        """
+        <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a>"""
         try:
             folium.Marker([float(r["lat"]), float(r["lon"])],
                           popup=popup,
@@ -197,13 +235,11 @@ if meth is not None and len(meth):
 folium.LayerControl(collapsed=False).add_to(m)
 st_folium(m, width=1200, height=700)
 
-# ---------- Exports ----------
-st.subheader("5) Exports (données actuellement affichées)")
-csv_ent = ent.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Télécharger entreprises (CSV)", data=csv_ent, file_name="entreprises_filtrees.csv", mime="text/csv")
+# ---------- Export ----------
+st.subheader("5) Export CSV des données affichées")
+csv_bytes = ent.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Télécharger les entreprises (CSV)", data=csv_bytes,
+                   file_name="entreprises_filtrees.csv", mime="text/csv")
 
-if meth is not None and len(meth):
-    csv_m = meth.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Télécharger méthaniseurs (CSV)", data=csv_m, file_name="methaniseurs.csv", mime="text/csv")
+st.caption("💡 Ajoute/retire des CSV dans data/entreprises/, puis redeploie pour mettre à jour.")
 
-st.caption("💡 Si le volume > ~100k points, pense à filtrer par NAF ou charger par zone pour garder de bonnes perfs.")
