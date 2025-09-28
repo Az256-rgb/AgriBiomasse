@@ -1,0 +1,5 @@
+streamlit>=1.37
+pandas>=2.2
+folium>=0.15
+streamlit-folium>=0.22
+openpyxl>=3.1
