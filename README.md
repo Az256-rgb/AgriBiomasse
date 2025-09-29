@@ -1,7 +1,3 @@
-Here’s a ready-to-paste **README.md** for your repo 👇
-
----
-
 # Carte entreprises par NAF (France) — Streamlit
 
 Application **Streamlit** pour afficher sur une carte interactive les entreprises françaises (par **codes NAF**) à partir de fichiers **par département** stockés **dans ce dépôt GitHub**.
