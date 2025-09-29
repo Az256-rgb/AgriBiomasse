@@ -14,7 +14,6 @@ st.title("🗺️ Carte entreprises par NAF — sélection par département + co
 ROOT = Path(__file__).parent
 DIR_ENT = ROOT / "data" / "entreprises"
 DIR_METH = ROOT / "data" / "methaniseurs"
-METH_FILE = DIR_METH / "methaniseurs.csv"   # optionnel
 
 # Colonnes SIRENE (selon ton fichier)
 COLS = {
@@ -31,13 +30,23 @@ COLS = {
     "siege": "etablissementSiege",
 }
 
-# ---------- Utils ----------
-def _read_csv_auto(path):
-    # tente séparateur auto, puis ";" si échec (certains exports)
-    try:
-        return pd.read_csv(path, sep=None, engine="python", low_memory=False)
-    except Exception:
-        return pd.read_csv(path, sep=";", low_memory=False)
+# ---------- Utils lecture ----------
+def _read_any(path: Path) -> pd.DataFrame:
+    """Lit .parquet, .csv.gz, .zip, .csv (auto-sep)."""
+    p = Path(path)
+    n = p.name.lower()
+    if n.endswith(".parquet"):
+        return pd.read_parquet(p)
+    if n.endswith(".csv.gz") or n.endswith(".gz"):
+        return pd.read_csv(p, compression="gzip", low_memory=False)
+    if n.endswith(".zip"):
+        return pd.read_csv(p, compression="zip", low_memory=False)
+    if n.endswith(".csv"):
+        try:
+            return pd.read_csv(p, sep=None, engine="python", low_memory=False)
+        except Exception:
+            return pd.read_csv(p, sep=";", low_memory=False)
+    raise ValueError(f"Format non supporté: {n}")
 
 def _norm(s: str):
     if not isinstance(s, str): return ""
@@ -54,24 +63,31 @@ def build_gmaps_link(lat, lon, nom=None, adresse=None):
     q = " ".join([str(x) for x in [nom, adresse] if x])
     return f"https://www.google.com/maps/search/?api=1&query={quote_plus(q)}"
 
-# ---------- Découverte des fichiers ----------
+# ---------- Fichiers entreprises ----------
 @st.cache_data(show_spinner=False)
 def list_dept_files():
-    files = sorted(DIR_ENT.glob("geo_siret_*.csv"))
+    """Retourne une liste [(dep_code, Path)] pour tous les fichiers geo_siret_XX.* (parquet/csvgz/zip/csv).
+       Gère aussi les splits: geo_siret_75_part1.parquet, etc."""
+    files = []
+    for ext in (".parquet", ".csv.gz", ".zip", ".csv"):
+        files.extend(DIR_ENT.glob(f"geo_siret_*{ext}"))
+    # supprime doublons éventuels
+    files = sorted(set(files), key=lambda p: p.name)
     out = []
     for f in files:
+        # dep = 01..95, 2A, 2B (ignore suffixe _partN)
         m = re.search(r"geo_siret_([0-9]{2}|2A|2B)", f.name, re.IGNORECASE)
         code = m.group(1).upper() if m else f.stem
         out.append((code, f))
     return out
 
-# ---------- Chargement multi-départements ----------
 @st.cache_data(show_spinner=True)
 def load_departments(selected_deps):
+    """Charge et concatène tous les fichiers correspondant aux départements sélectionnés (y compris part1/part2...)."""
     frames = []
     for dep_code, f in list_dept_files():
         if dep_code in selected_deps:
-            df = _read_csv_auto(f)
+            df = _read_any(f)
             df["__dep__"] = dep_code
             df["__source__"] = f.name
             frames.append(df)
@@ -79,37 +95,60 @@ def load_departments(selected_deps):
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
-# ---------- Charge méthaniseurs (optionnel) ----------
+# ---------- Fichier méthaniseurs ----------
+def _find_meth_file() -> Path | None:
+    """Cherche (par priorité) methaniseurs.parquet, methaniseurs.csv.gz, methaniseurs.csv."""
+    candidates = [
+        DIR_METH / "methaniseurs.parquet",
+        DIR_METH / "methaniseurs.csv.gz",
+        DIR_METH / "methaniseurs.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    # sinon, prend le premier fichier du dossier si présent
+    for ext in (".parquet", ".csv.gz", ".csv"):
+        found = list(DIR_METH.glob(f"*{ext}"))
+        if found:
+            return found[0]
+    return None
+
 @st.cache_data(show_spinner=False)
 def load_methaniseurs():
-    if not METH_FILE.exists():
+    p = _find_meth_file()
+    if not p:
         return None
-    dfm = _read_csv_auto(METH_FILE)
-    # colonnes attendues: nom, adresse, latitude, longitude (tolère variantes simples)
-    def find_col(cands):
+    dfm = _read_any(p)
+
+    # colonnes possibles
+    def find_col(cols, cands):
         for c in cands:
-            if c in dfm.columns: return c
+            if c in cols: return c
         return None
-    c_lat = find_col(["latitude","lat","y"])
-    c_lon = find_col(["longitude","lon","x"])
-    c_nom = find_col(["nom","name","denomination","enseigne"])
-    c_addr= find_col(["adresse","address","geo_adresse"])
+    c_lat = find_col(dfm.columns, ["latitude","lat","y"])
+    c_lon = find_col(dfm.columns, ["longitude","lon","x"])
+    c_nom = find_col(dfm.columns, ["nom","name","denomination","enseigne"])
+    c_addr= find_col(dfm.columns, ["adresse","address","geo_adresse"])
+
     if not c_lat or not c_lon:
         return None
+
     dfm["lat"] = pd.to_numeric(dfm[c_lat].astype(str).str.replace(",", ".", regex=False), errors="coerce")
     dfm["lon"] = pd.to_numeric(dfm[c_lon].astype(str).str.replace(",", ".", regex=False), errors="coerce")
     dfm = dfm[dfm["lat"].notna() & dfm["lon"].notna()].copy()
+
     if c_nom and "nom" not in dfm.columns: dfm.rename(columns={c_nom:"nom"}, inplace=True)
     if c_addr and "adresse" not in dfm.columns: dfm.rename(columns={c_addr:"adresse"}, inplace=True)
+
     dfm["gmaps_url"] = dfm.apply(lambda r: build_gmaps_link(r.get("lat"), r.get("lon"), r.get("nom"), r.get("adresse")), axis=1)
     keep = [c for c in ["nom","adresse","lat","lon","gmaps_url"] if c in dfm.columns]
     return dfm[keep].copy()
 
 # ---------- UI: Départements ----------
 deps = list_dept_files()
-dep_codes = [d for d,_ in deps]
+dep_codes = sorted({d for d,_ in deps})
 if not deps:
-    st.error("Aucun fichier trouvé dans data/entreprises/ (ex: geo_siret_01.csv).")
+    st.error("Aucun fichier trouvé dans data/entreprises/ (ex: geo_siret_01.parquet ou .csv.gz ou .csv).")
     st.stop()
 
 st.subheader("1) Sélection des départements")
@@ -125,7 +164,7 @@ else:
 df_raw = load_departments(selected_deps)
 st.write(f"📥 Lignes chargées: **{len(df_raw):,}** (dep: {len(selected_deps)})")
 
-# ---------- Garde colonnes utiles ----------
+# ---------- Vérif colonnes ----------
 missing = [c for c in COLS.values() if c not in df_raw.columns]
 if missing:
     st.warning("⚠️ Colonnes manquantes (vérifie l’export): " + ", ".join(missing))
@@ -165,7 +204,7 @@ if only_siege and COLS["siege"] in df.columns:
 
 # Coordonnées
 if COLS["lat"] not in df.columns or COLS["lon"] not in df.columns:
-    st.error("Colonnes latitude/longitude absentes. Tes CSV doivent être géolocalisés.")
+    st.error("Colonnes latitude/longitude absentes. Tes fichiers doivent être géolocalisés.")
     st.stop()
 
 df["lat"] = pd.to_numeric(df[COLS["lat"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
@@ -194,10 +233,14 @@ st.success(f"✅ Entreprises à afficher : **{len(ent):,}**")
 
 # ---------- Couche Méthaniseurs ----------
 st.subheader("3) Couche optionnelle : Méthaniseurs")
-show_meth = st.checkbox("Afficher la couche 'Méthaniseurs' si data/methaniseurs/methaniseurs.csv est présent", value=METH_FILE.exists())
+meth_file = _find_meth_file()
+show_meth = st.checkbox(
+    "Afficher la couche 'Méthaniseurs' (si un fichier est présent dans data/methaniseurs/)",
+    value=bool(meth_file)
+)
 meth = load_methaniseurs() if show_meth else None
 if show_meth and meth is None:
-    st.info("Aucun fichier valide trouvé pour les méthaniseurs (attendu: nom, adresse, latitude, longitude).")
+    st.info("Aucun fichier valide trouvé pour les méthaniseurs (attendu: nom, adresse, lat, lon).")
 
 # ---------- Carte ----------
 st.subheader("4) Carte")
@@ -241,5 +284,5 @@ csv_bytes = ent.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Télécharger les entreprises (CSV)", data=csv_bytes,
                    file_name="entreprises_filtrees.csv", mime="text/csv")
 
-st.caption("💡 Ajoute/retire des CSV dans data/entreprises/, puis redeploie pour mettre à jour.")
+st.caption("💡 Ajoute/retire des fichiers dans data/entreprises/ (formats: .parquet, .csv.gz, .zip, .csv), puis redeploie pour mettre à jour.")
 
