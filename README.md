@@ -124,22 +124,6 @@ Le script :
 
 ---
 
-## ❓ FAQ
-
-**Q. Mes fichiers sont trop gros pour GitHub.**
-A. Convertissez en **Parquet** (ou `.csv.gz`). Si un département dépasse encore, scindez-le en 2 (`geo_siret_75_part1.parquet`, `…_part2.parquet`) : l’app les chargera tous.
-
-**Q. L’app ne voit pas mes fichiers.**
-A. Respectez le **pattern de nommage** `geo_siret_XX.*` et placez-les dans `data/entreprises/`.
-
-**Q. Les popups n’affichent pas le nom.**
-A. L’app utilise `denominationUsuelleEtablissement` puis `enseigne1Etablissement`. Vérifiez que l’un des deux est présent.
-
-**Q. Je veux d’autres couches (ex. gisements, clients).**
-A. Ajoutez vos fichiers dans un nouveau dossier `data/<nom_couche>/` et répliquez la logique de lecture/affichage (ex. comme “Méthaniseurs”).
-
----
-
 ## 🔒 Données & conformité
 
 * Données issues de SIRENE : veillez à respecter les règles de diffusion (CNIL, réutilisation).
