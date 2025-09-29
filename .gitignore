@@ -1,0 +1,14 @@
+# dossiers locaux / gros bruts
+raw/
+*.zip
+*.7z
+*.tar*
+# python
+__pycache__/
+.venv/
+.env
+*.pyc
+# mac / ide
+.DS_Store
+.idea/
+.vscode/
