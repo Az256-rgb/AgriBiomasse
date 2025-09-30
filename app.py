@@ -134,19 +134,27 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
 
 # ---------- Chargement filtré ----------
 def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> pd.DataFrame:
+    # Evite le SettingWithCopyWarning + travaille sur une copie
+    df = df.copy()
+
     if COLS["etat"] in df.columns:
         df = df[df[COLS["etat"]].astype(str).str.upper().str.startswith("A")]
+
     if naf_set and COLS["naf"] in df.columns:
         naf_clean = df[COLS["naf"]].astype(str).str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
         df = df[naf_clean.isin(list(naf_set))]
+
     if only_siege and COLS["siege"] in df.columns:
         df = df[df[COLS["siege"]].astype(str).isin(["1","True","true","O","Oui"])]
-    # coords
+
+    # Coords en numérique
     if COLS["lat"] in df.columns and COLS["lon"] in df.columns:
-        df[COLS["lat"]] = pd.to_numeric(df[COLS["lat"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
-        df[COLS["lon"]] = pd.to_numeric(df[COLS["lon"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        df.loc[:, COLS["lat"]] = pd.to_numeric(df[COLS["lat"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        df.loc[:, COLS["lon"]] = pd.to_numeric(df[COLS["lon"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
         df = df[df[COLS["lat"]].notna() & df[COLS["lon"]].notna()]
+
     return df
+
 
 def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege: bool) -> pd.DataFrame:
     fb = files_by_dep()
@@ -268,35 +276,58 @@ selected_deps = st.multiselect(
 )
 
 st.subheader("2) Codes NAF")
+
+# Multiselect alimenté par un scan (on ne scanne que si l'utilisateur le demande)
 colA, colB = st.columns([2,1])
 with colA:
-    naf_input = st.text_input("Saisis des codes NAF séparés par des virgules (ex: 10.51C, 47.29Z)", value="")
+    naf_input = st.text_input("Saisis des codes NAF (séparés par des virgules)", value="")
 with colB:
-    scan_click = st.button("Scanner les codes NAF (peut être long)")
-naf_from_scan = []
+    scan_click = st.button("Scanner les codes NAF (colonne NAF)")
+
+# On mémorise la liste scannée dans la session pour éviter de rescanner à chaque rerun
+if "naf_options" not in st.session_state:
+    st.session_state["naf_options"] = []
+
 if scan_click:
-    with st.spinner("Scan des codes NAF sur les départements sélectionnés…"):
-        naf_from_scan = discover_naf_codes(tuple(selected_deps)) if selected_deps else []
-    if naf_from_scan:
-        st.success(f"{len(naf_from_scan)} codes trouvés. Tu peux affiner en saisissant ci-contre.")
-        st.write(", ".join(naf_from_scan[:100]) + (" ..." if len(naf_from_scan)>100 else ""))
+    if not selected_deps:
+        st.warning("Sélectionne d'abord au moins un département pour scanner les codes NAF.")
+    else:
+        with st.spinner("Scan des codes NAF sur les départements sélectionnés…"):
+            st.session_state["naf_options"] = discover_naf_codes(tuple(selected_deps))
+
+naf_select_ms = st.multiselect(
+    "…ou choisis dans la liste déroulante (issue du scan)",
+    options=st.session_state["naf_options"],
+    default=[]
+)
+
+# Fusion des codes saisis + sélectionnés
+naf_typed = [re.sub(r"[^0-9A-Z.]", "", c.upper()) for c in naf_input.split(",")]
+naf_typed = [c for c in naf_typed if c]
+naf_final = sorted(set(naf_typed) | set(naf_select_ms))
 
 # Checkbox siège
 only_siege = st.checkbox("Ne garder que les sièges (etablissementSiege=1)", value=False)
 
-# Bouton de chargement
-st.subheader("3) Charger les données filtrées")
-go = st.button("Charger la carte")
+# --- Boutons persistants ---
+if "go" not in st.session_state:
+    st.session_state["go"] = False
 
-if go:
+st.subheader("3) Charger les données filtrées")
+col_go, col_reset = st.columns([1,1])
+with col_go:
+    if st.button("Charger la carte"):
+        st.session_state["go"] = True
+with col_reset:
+    if st.button("Réinitialiser"):
+        st.session_state["go"] = False
+        st.session_state["naf_options"] = []
+
+# --- Affichage conditionnel persistant ---
+if st.session_state["go"]:
     if not selected_deps:
         st.warning("Sélectionne au moins un département.")
         st.stop()
-
-    # Construire la liste NAF finale
-    naf_typed = [re.sub(r"[^0-9A-Z.]", "", c.upper()) for c in naf_input.split(",")]
-    naf_typed = [c for c in naf_typed if c]
-    naf_final = naf_typed or naf_from_scan  # si rien saisi, on prend ceux du scan (éventuellement vide)
 
     with st.spinner("Chargement filtré…"):
         df = load_filtered(selected_deps, naf_final, only_siege)
@@ -305,9 +336,11 @@ if go:
         st.info("Aucune ligne avec ces filtres (NAF, siège, coordonnées) dans les départements sélectionnés.")
         st.stop()
 
-    # Construction tableau final
-    df["lat"] = pd.to_numeric(df[COLS["lat"]], errors="coerce")
-    df["lon"] = pd.to_numeric(df[COLS["lon"]], errors="coerce")
+    # Construction tableau final (avec loc pour éviter SettingWithCopy)
+    df = df.copy()
+    df.loc[:, "lat"] = pd.to_numeric(df[COLS["lat"]], errors="coerce")
+    df.loc[:, "lon"] = pd.to_numeric(df[COLS["lon"]], errors="coerce")
+
     ent = pd.DataFrame({
         "siret": df.get(COLS["siret"], ""),
         "nom": df.apply(coalesce_name, axis=1),
@@ -325,6 +358,10 @@ if go:
     if len(ent) > 50_000:
         st.warning("Beaucoup de points à afficher. J’affiche un échantillon de 50 000 pour garder la carte fluide.")
         ent = ent.sample(50_000, random_state=1)
+
+    # …puis TON bloc carte/folium + export, inchangé…
+else:
+    st.info("💡 Sélectionne 1–n départements, choisis des codes NAF (scan ou saisie), puis clique *Charger la carte*.")
 
     # Couche Méthaniseurs
     st.subheader("4) Couche optionnelle : Méthaniseurs")
