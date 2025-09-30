@@ -31,21 +31,43 @@ COLS = {
 }
 
 # ---------- Utils lecture ----------
+def _read_csv_auto(path: Path, compression: str | None = None) -> pd.DataFrame:
+    """
+    Lecture CSV robuste : essaie auto-sep (engine='python') puis ';' puis ',' puis tab,
+    et encodages utf-8 puis latin1. SANS low_memory (incompatible avec engine='python').
+    """
+    seps = [None, ";", ",", "\t"]           # None => autodétection
+    encs = ["utf-8", "latin1"]
+    last_err = None
+    for sep in seps:
+        for enc in encs:
+            try:
+                kwargs = dict(encoding=enc, on_bad_lines="skip")
+                if sep is None:
+                    kwargs.update(sep=None, engine="python")
+                else:
+                    kwargs.update(sep=sep)
+                if compression:
+                    kwargs.update(compression=compression)
+                return pd.read_csv(path, **kwargs)
+            except Exception as e:
+                last_err = e
+                continue
+    raise RuntimeError(f"Impossible de lire {path.name} (dernier: {type(last_err).__name__})")
+
 def _read_any(path: Path) -> pd.DataFrame:
     """Lit .parquet, .csv.gz, .zip, .csv (auto-sep)."""
     p = Path(path)
     n = p.name.lower()
     if n.endswith(".parquet"):
-        return pd.read_parquet(p)
+        return pd.read_parquet(p)  # nécessite pyarrow
     if n.endswith(".csv.gz") or n.endswith(".gz"):
-        return pd.read_csv(p, compression="gzip", low_memory=False)
+        return _read_csv_auto(p, compression="gzip")
     if n.endswith(".zip"):
-        return pd.read_csv(p, compression="zip", low_memory=False)
+        # Remarque: pandas lira le premier CSV du zip.
+        return _read_csv_auto(p, compression="zip")
     if n.endswith(".csv"):
-        try:
-            return pd.read_csv(p, sep=None, engine="python", low_memory=False)
-        except Exception:
-            return pd.read_csv(p, sep=";", low_memory=False)
+        return _read_csv_auto(p, compression=None)
     raise ValueError(f"Format non supporté: {n}")
 
 def _norm(s: str):
@@ -64,19 +86,22 @@ def build_gmaps_link(lat, lon, nom=None, adresse=None):
     return f"https://www.google.com/maps/search/?api=1&query={quote_plus(q)}"
 
 # ---------- Fichiers entreprises ----------
+DEPT_RE = re.compile(r"geo_siret_([0-9]{2}|[0-9]{3}|2A|2B)", re.IGNORECASE)  # 2 chiffres, 3 chiffres (DOM), 2A/2B
+
 @st.cache_data(show_spinner=False)
 def list_dept_files():
-    """Retourne une liste [(dep_code, Path)] pour tous les fichiers geo_siret_XX.* (parquet/csvgz/zip/csv).
-       Gère aussi les splits: geo_siret_75_part1.parquet, etc."""
+    """
+    Retourne une liste [(dep_code, Path)] pour tous les fichiers geo_siret_XX*.{parquet,csvgz,zip,csv}.
+    Gère aussi les splits: geo_siret_75_part1.parquet, etc.
+    """
     files = []
     for ext in (".parquet", ".csv.gz", ".zip", ".csv"):
         files.extend(DIR_ENT.glob(f"geo_siret_*{ext}"))
-    # supprime doublons éventuels
-    files = sorted(set(files), key=lambda p: p.name)
+    files = sorted(set(files), key=lambda p: p.name)  # dédoublonne éventuel
+
     out = []
     for f in files:
-        # dep = 01..95, 2A, 2B (ignore suffixe _partN)
-        m = re.search(r"geo_siret_([0-9]{2}|2A|2B)", f.name, re.IGNORECASE)
+        m = DEPT_RE.search(f.name)
         code = m.group(1).upper() if m else f.stem
         out.append((code, f))
     return out
@@ -106,7 +131,6 @@ def _find_meth_file() -> Path | None:
     for p in candidates:
         if p.exists():
             return p
-    # sinon, prend le premier fichier du dossier si présent
     for ext in (".parquet", ".csv.gz", ".csv"):
         found = list(DIR_METH.glob(f"*{ext}"))
         if found:
@@ -120,16 +144,15 @@ def load_methaniseurs():
         return None
     dfm = _read_any(p)
 
-    # colonnes possibles
     def find_col(cols, cands):
         for c in cands:
             if c in cols: return c
         return None
+
     c_lat = find_col(dfm.columns, ["latitude","lat","y"])
     c_lon = find_col(dfm.columns, ["longitude","lon","x"])
     c_nom = find_col(dfm.columns, ["nom","name","denomination","enseigne"])
     c_addr= find_col(dfm.columns, ["adresse","address","geo_adresse"])
-
     if not c_lat or not c_lon:
         return None
 
@@ -146,7 +169,7 @@ def load_methaniseurs():
 
 # ---------- UI: Départements ----------
 deps = list_dept_files()
-dep_codes = sorted({d for d,_ in deps})
+dep_codes = sorted({d for d,_ in deps}, key=lambda x: (len(x), x))
 if not deps:
     st.error("Aucun fichier trouvé dans data/entreprises/ (ex: geo_siret_01.parquet ou .csv.gz ou .csv).")
     st.stop()
