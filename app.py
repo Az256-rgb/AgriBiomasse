@@ -359,11 +359,7 @@ if st.session_state["go"]:
         st.warning("Beaucoup de points à afficher. J’affiche un échantillon de 50 000 pour garder la carte fluide.")
         ent = ent.sample(50_000, random_state=1)
 
-    # …puis TON bloc carte/folium + export, inchangé…
-else:
-    st.info("💡 Sélectionne 1–n départements, choisis des codes NAF (scan ou saisie), puis clique *Charger la carte*.")
-
-    # Couche Méthaniseurs
+    # ---------- Couche Méthaniseurs ----------
     st.subheader("4) Couche optionnelle : Méthaniseurs")
     meth_file = _find_meth_file()
     show_meth = st.checkbox(
@@ -374,19 +370,21 @@ else:
     if show_meth and meth is None:
         st.info("Aucun fichier valide trouvé pour les méthaniseurs (attendu: nom, adresse, lat, lon).")
 
-    # Carte
+    # ---------- Carte ----------
     st.subheader("5) Carte")
     m = folium.Map(location=[46.6, 2.4], zoom_start=6, tiles="OpenStreetMap")
     cluster_ent = MarkerCluster(name="Entreprises").add_to(m)
 
     for _, r in ent.iterrows():
+        pj = build_pj_link(r["nom"], r["adresse"], r["cp"], r["commune"])
+        gm = build_gmaps_link(r["lat"], r["lon"], r["nom"], r["adresse"])
         popup = f"""<b>{_norm(r.get('nom',''))}</b><br>
         {r.get('adresse','') or ''}<br>
         {(r.get('cp','') or '')} {(r.get('commune','') or '')}<br>
         Dép: {r.get('__dep__','')} | SIRET: {r.get('siret','') or ''}<br>
         NAF: {r.get('naf','') or ''}<br>
-        <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a> |
-        <a href="{r.get('pj_url','')}" target="_blank">PagesJaunes</a>"""
+        <a href="{gm}" target="_blank">Google Maps</a> |
+        <a href="{pj}" target="_blank">PagesJaunes</a>"""
         try:
             folium.Marker([float(r["lat"]), float(r["lon"])],
                           popup=popup,
@@ -410,11 +408,11 @@ else:
     folium.LayerControl(collapsed=False).add_to(m)
     st_folium(m, width=1200, height=700)
 
-    # Export
+    # ---------- Export ----------
     st.subheader("6) Export CSV des données affichées")
     csv_bytes = ent.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Télécharger les entreprises (CSV)", data=csv_bytes,
                        file_name="entreprises_filtrees.csv", mime="text/csv")
+
 else:
     st.info("💡 Sélectionne d’abord 1–n départements, saisis (ou scanne) des codes NAF, puis clique *Charger la carte*.")
-
