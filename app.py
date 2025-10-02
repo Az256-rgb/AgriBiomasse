@@ -7,32 +7,33 @@ from streamlit_folium import st_folium
 import folium
 from folium.plugins import MarkerCluster
 
-# Pour les Parquet filtrés
+# Parquet / Arrow
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.compute as pc
 
-# ---------- Config ----------
+# ==================== CONFIG ====================
 st.set_page_config(page_title="Carte entreprises par NAF (départements + méthaniseurs)", layout="wide")
 st.title("🗺️ Carte entreprises par NAF — sélection par département + couche Méthaniseurs")
 
-ROOT = Path(__file__).parent
-DIR_ENT = ROOT / "data" / "entreprises"
+ROOT     = Path(__file__).parent
+DIR_ENT  = ROOT / "data" / "entreprises"
 DIR_METH = ROOT / "data" / "methaniseurs"
+DIR_UL   = ROOT / "data" / "unite_legale" / "ul_parts"   # <-- UL partitions
 
-# Colonnes SIRENE (selon tes fichiers)
+# Colonnes SIRENE (selon tes fichiers entreprises)
 COLS = {
-    "siret": "siret",
-    "etat": "etatAdministratifEtablissement",
-    "naf": "activitePrincipaleEtablissement",
-    "enseigne1": "enseigne1Etablissement",
-    "denom": "denominationUsuelleEtablissement",
-    "lon": "longitude",
-    "lat": "latitude",
+    "siret":   "siret",
+    "etat":    "etatAdministratifEtablissement",
+    "naf":     "activitePrincipaleEtablissement",
+    "enseigne1":"enseigne1Etablissement",
+    "denom":   "denominationUsuelleEtablissement",
+    "lon":     "longitude",
+    "lat":     "latitude",
     "adresse": "geo_adresse",
-    "cp": "codePostalEtablissement",
+    "cp":      "codePostalEtablissement",
     "commune": "libelleCommuneEtablissement",
-    "siege": "etablissementSiege",
+    "siege":   "etablissementSiege",
 }
 
 NEEDED_COLS = [
@@ -42,15 +43,20 @@ NEEDED_COLS = [
 
 DEPT_RE = re.compile(r"geo_siret_([0-9]{2}|[0-9]{3}|2A|2B)", re.IGNORECASE)  # 2ch, DOM à 3ch, 2A/2B
 
-# ---------- Utils ----------
+# ==================== UTILS ====================
 def _norm(s: str):
     if not isinstance(s, str): return ""
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
     return re.sub(r"[^0-9A-Za-z ]+", " ", s).strip()
 
 def build_pj_link(nom, adresse, cp, commune):
-    terms = " ".join([str(x) for x in [nom, adresse, cp, commune] if x])
-    return f"https://www.pagesjaunes.fr/recherche/{quote_plus(terms)}"
+    # Requête PJ plus tolérante (quoiqui + ou)
+    quoiqui = (nom or "").strip()
+    if not quoiqui:
+        quoiqui = (adresse or "").strip() or (commune or "").strip()
+    ou = " ".join([str(cp or "").strip(), str(commune or "").strip()]).strip()
+    base = "https://www.pagesjaunes.fr/recherche"
+    return f"{base}?quoiqui={quote_plus(quoiqui)}&ou={quote_plus(ou)}"
 
 def build_gmaps_link(lat, lon, nom=None, adresse=None):
     if pd.notna(lat) and pd.notna(lon):
@@ -58,14 +64,14 @@ def build_gmaps_link(lat, lon, nom=None, adresse=None):
     q = " ".join([str(x) for x in [nom, adresse] if x])
     return f"https://www.google.com/maps/search/?api=1&query={quote_plus(q)}"
 
-def coalesce_name(row):
+def coalesce_name_etab(row):
     for c in (COLS["denom"], COLS["enseigne1"]):
         v = row.get(c)
         if isinstance(v, str) and v.strip():
-            return v
+            return v.strip()
     return ""
 
-# ---------- Fichiers disponibles ----------
+# ==================== FICHIERS DISPONIBLES ====================
 @st.cache_data(show_spinner=False)
 def files_by_dep():
     """Retourne {dep: [Paths...]} en groupant toutes les parts/suffixes."""
@@ -77,11 +83,10 @@ def files_by_dep():
         m = DEPT_RE.search(f.name)
         code = (m.group(1).upper() if m else f.stem)
         out.setdefault(code, []).append(f)
-    # tri stable pour affichage
     out = {k: sorted(v, key=lambda p: p.name) for k, v in out.items()}
     return out
 
-# ---------- Découverte NAF (optionnel) ----------
+# ==================== DÉCOUVERTE NAF (OPTIONNEL) ====================
 @st.cache_data(show_spinner=True)
 def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
     """Lit uniquement la colonne NAF des départements sélectionnés (Parquet en pushdown, CSV en échantillon/chunks)."""
@@ -95,9 +100,14 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
                     dset = ds.dataset([str(f)], format="parquet")
                     t = dset.to_table(columns=[COLS["naf"]])
                     s = pd.Series(t[COLS["naf"]].to_pandas(dtype="string", types_mapper=pd.ArrowDtype))
-                    naf.update(s.astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True).dropna().unique())
+                    naf.update(
+                        s.astype("string")
+                         .str.upper()
+                         .str.replace(r"[^0-9A-Z.]", "", regex=True)
+                         .dropna()
+                         .unique()
+                    )
                 elif name.endswith(".csv.gz") or name.endswith(".gz") or name.endswith(".csv") or name.endswith(".zip"):
-                    # lecture partielle / chunks pour éviter la RAM
                     seps = [None, ";", ",", "\t"]; encs = ["utf-8", "latin1"]
                     read_ok = False
                     for sep in seps:
@@ -118,7 +128,7 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
                                     s = ch[COLS["naf"]].astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
                                     naf.update(s.dropna().unique())
                                     cnt += len(ch)
-                                    if cnt >= 600_000:  # plafonner le scan par fichier
+                                    if cnt >= 600_000:
                                         break
                                 read_ok = True
                                 break
@@ -130,11 +140,10 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
             except Exception:
                 continue
     codes = sorted([c for c in naf if c], key=lambda x: (len(x), x))
-    return codes[:2000]  # limite raisonnable pour l’UI
+    return codes[:2000]
 
-# ---------- Chargement filtré ----------
+# ==================== CHARGEMENT FILTRÉ (ENTREPRISES) ====================
 def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> pd.DataFrame:
-    # Evite le SettingWithCopyWarning + travaille sur une copie
     df = df.copy()
 
     if COLS["etat"] in df.columns:
@@ -147,7 +156,6 @@ def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> 
     if only_siege and COLS["siege"] in df.columns:
         df = df[df[COLS["siege"]].astype(str).isin(["1","True","true","O","Oui"])]
 
-    # Coords en numérique
     if COLS["lat"] in df.columns and COLS["lon"] in df.columns:
         df.loc[:, COLS["lat"]] = pd.to_numeric(df[COLS["lat"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
         df.loc[:, COLS["lon"]] = pd.to_numeric(df[COLS["lon"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
@@ -155,22 +163,20 @@ def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> 
 
     return df
 
-
 def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege: bool) -> pd.DataFrame:
     fb = files_by_dep()
     naf_set = {re.sub(r"[^0-9A-Z.]", "", c.upper()) for c in naf_selected if c}
     frames = []
 
-    needed = [c for c in NEEDED_COLS if c]  # toutes les colonnes utiles
+    needed = [c for c in NEEDED_COLS if c]
     for dep in selected_deps:
         files = fb.get(dep, [])
         if not files:
             continue
 
-        # 1) Parquet (filtre pushdown sur NAF si possible)
+        # 1) Parquet
         pq_files = [str(p) for p in files if p.suffix.lower() == ".parquet"]
         if pq_files:
-            # Filtre pushdown NAF + colonnes minimales
             filt = None
             if naf_set:
                 filt = pc.field(COLS["naf"]).isin(list(naf_set))
@@ -181,13 +187,13 @@ def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege:
                 df = tbl.to_pandas()
                 df["__dep__"] = dep
                 df["__source__"] = "parquet"
-                df = _filter_in_pandas(df, naf_set=set(), only_siege=only_siege)  # état/siege/coords côté pandas
+                df = _filter_in_pandas(df, naf_set=set(), only_siege=only_siege)
                 if not df.empty:
                     frames.append(df)
             except Exception:
                 pass
 
-        # 2) CSV-like (chunks + filtre en flux)
+        # 2) CSV-like
         csv_files = [p for p in files if p.suffix.lower() in (".csv", ".gz", ".zip") or p.name.lower().endswith(".csv.gz")]
         for f in csv_files:
             name = f.name.lower()
@@ -221,7 +227,80 @@ def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege:
         return pd.DataFrame(columns=[c for c in needed] + ["__dep__","__source__"])
     return pd.concat(frames, ignore_index=True)
 
-# ---------- Méthaniseurs ----------
+# ==================== UNITE LEGALE : LECTURE & JOINTURE ====================
+UL_NAME_COLS = [
+    "denominationUniteLegale",
+    "denominationUsuelle1UniteLegale",
+    "denominationUsuelle2UniteLegale",
+    "denominationUsuelle3UniteLegale",
+    "sigleUniteLegale",
+    "nomUsageUniteLegale",
+    "nomUniteLegale",
+    "prenom1UniteLegale",
+    "prenomUsuelUniteLegale",
+    "pseudonymeUniteLegale",
+]
+
+def _best_ul_name(row: pd.Series) -> str:
+    # 1) Personnes morales
+    for c in [
+        "denominationUniteLegale",
+        "denominationUsuelle1UniteLegale",
+        "denominationUsuelle2UniteLegale",
+        "denominationUsuelle3UniteLegale",
+        "sigleUniteLegale",
+    ]:
+        v = row.get(c)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # 2) Personnes physiques
+    prenom = (row.get("prenom1UniteLegale") or row.get("prenomUsuelUniteLegale") or "").strip()
+    nom    = (row.get("nomUsageUniteLegale") or row.get("nomUniteLegale") or "").strip()
+    if nom or prenom:
+        return (prenom + " " + nom).strip()
+    # 3) Repli
+    v = row.get("pseudonymeUniteLegale")
+    return (v or "").strip()
+
+@st.cache_data(show_spinner=False)
+def load_ul_names_for(sirens: list[str]) -> pd.DataFrame:
+    """
+    Charge 'siren' + colonnes nom depuis data/unite_legale/ul_parts/*.parquet,
+    filtré sur les SIREN demandés. Retour: ['siren','nom_ul'] (unique par siren).
+    """
+    if not sirens:
+        return pd.DataFrame(columns=["siren","nom_ul"])
+    if not DIR_UL.exists():
+        st.warning("Dossier data/unite_legale/ul_parts introuvable.")
+        return pd.DataFrame(columns=["siren","nom_ul"])
+
+    parts = sorted(DIR_UL.glob("*.parquet"))
+    if not parts:
+        st.warning("Aucun fichier parquet dans data/unite_legale/ul_parts.")
+        return pd.DataFrame(columns=["siren","nom_ul"])
+
+    dset = ds.dataset([str(p) for p in parts], format="parquet")
+    cols = ["siren"] + [c for c in UL_NAME_COLS if c in dset.schema.names]
+
+    CHUNK = 50_000
+    frames = []
+    for i in range(0, len(sirens), CHUNK):
+        chunk = sirens[i:i+CHUNK]
+        filt = pc.field("siren").isin(pa.array(chunk, type=pa.string()))
+        tbl  = dset.to_table(columns=cols, filter=filt)
+        df   = tbl.to_pandas()
+        if not df.empty:
+            df["nom_ul"] = df.apply(_best_ul_name, axis=1)
+            frames.append(df[["siren","nom_ul"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["siren","nom_ul"])
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["siren"], keep="first")  # évite toute duplication à la jointure
+    return out
+
+# ==================== METHANISEURS ====================
 def _find_meth_file() -> Path | None:
     for p in [DIR_METH / "methaniseurs.parquet", DIR_METH / "methaniseurs.csv.gz", DIR_METH / "methaniseurs.csv"]:
         if p.exists(): return p
@@ -259,8 +338,7 @@ def load_methaniseurs():
     keep = [c for c in ["nom","adresse","lat","lon","gmaps_url"] if c in dfm.columns]
     return dfm[keep].copy()
 
-# ===================== UI =====================
-
+# ==================== UI ====================
 fb = files_by_dep()
 if not fb:
     st.error("Aucun fichier trouvé dans data/entreprises/ (ex: geo_siret_01.parquet).")
@@ -276,15 +354,12 @@ selected_deps = st.multiselect(
 )
 
 st.subheader("2) Codes NAF")
-
-# Multiselect alimenté par un scan (on ne scanne que si l'utilisateur le demande)
 colA, colB = st.columns([2,1])
 with colA:
     naf_input = st.text_input("Saisis des codes NAF (séparés par des virgules)", value="")
 with colB:
     scan_click = st.button("Scanner les codes NAF (colonne NAF)")
 
-# On mémorise la liste scannée dans la session pour éviter de rescanner à chaque rerun
 if "naf_options" not in st.session_state:
     st.session_state["naf_options"] = []
 
@@ -301,15 +376,12 @@ naf_select_ms = st.multiselect(
     default=[]
 )
 
-# Fusion des codes saisis + sélectionnés
 naf_typed = [re.sub(r"[^0-9A-Z.]", "", c.upper()) for c in naf_input.split(",")]
 naf_typed = [c for c in naf_typed if c]
 naf_final = sorted(set(naf_typed) | set(naf_select_ms))
 
-# Checkbox siège
 only_siege = st.checkbox("Ne garder que les sièges (etablissementSiege=1)", value=False)
 
-# --- Boutons persistants ---
 if "go" not in st.session_state:
     st.session_state["go"] = False
 
@@ -323,38 +395,80 @@ with col_reset:
         st.session_state["go"] = False
         st.session_state["naf_options"] = []
 
-# --- Affichage conditionnel persistant ---
+# ==================== RUN ====================
 if st.session_state["go"]:
     if not selected_deps:
         st.warning("Sélectionne au moins un département.")
         st.stop()
 
-    with st.spinner("Chargement filtré…"):
+    with st.spinner("Chargement filtré (entreprises)…"):
         df = load_filtered(selected_deps, naf_final, only_siege)
 
     if df.empty:
         st.info("Aucune ligne avec ces filtres (NAF, siège, coordonnées) dans les départements sélectionnés.")
         st.stop()
 
-    # Construction tableau final (avec loc pour éviter SettingWithCopy)
+    # === Base entreprises (avant jointure) ===
     df = df.copy()
     df.loc[:, "lat"] = pd.to_numeric(df[COLS["lat"]], errors="coerce")
     df.loc[:, "lon"] = pd.to_numeric(df[COLS["lon"]], errors="coerce")
 
     ent = pd.DataFrame({
-        "siret": df.get(COLS["siret"], ""),
-        "nom": df.apply(coalesce_name, axis=1),
-        "adresse": df.get(COLS["adresse"], ""),
-        "cp": df.get(COLS["cp"], "").astype(str),
-        "commune": df.get(COLS["commune"], ""),
-        "naf": df.get(COLS["naf"], ""),
-        "lat": df["lat"],
-        "lon": df["lon"],
-        "__dep__": df["__dep__"],
+        "siret":    df.get(COLS["siret"], "").astype(str),
+        "nom_etab": df.apply(coalesce_name_etab, axis=1),
+        "adresse":  df.get(COLS["adresse"], ""),
+        "cp":       df.get(COLS["cp"], "").astype(str),
+        "commune":  df.get(COLS["commune"], ""),
+        "naf":      df.get(COLS["naf"], ""),
+        "lat":      df["lat"],
+        "lon":      df["lon"],
+        "__dep__":  df["__dep__"],
         "__source__": df["__source__"],
     })
 
-    st.success(f"✅ Entreprises à afficher : **{len(ent):,}**")
+    # Comptes avant jointure (contrôle pertes / doublons)
+    rows_before        = len(ent)
+    siret_uniq_before  = ent["siret"].nunique()
+    # SIREN (9 premiers caractères, robustesse si siret < 9 chars)
+    ent["siren"] = ent["siret"].str.slice(0, 9)
+    siren_uniq_before  = ent["siren"].nunique()
+
+    # === Jointure UL ===
+    with st.spinner("Jointure des noms d’Unité Légale…"):
+        sirens_need = sorted(ent["siren"].dropna().unique().tolist())
+        ul = load_ul_names_for(sirens_need)  # ['siren','nom_ul'] unique
+
+    ent = ent.merge(ul, on="siren", how="left")
+
+    # Nom final : priorité UL, repli sur établissement
+    ent["nom_affiche"] = ent["nom_ul"]
+    mask_vide = ent["nom_affiche"].isna() | (ent["nom_affiche"].astype(str).str.strip()=="")
+    ent.loc[mask_vide, "nom_affiche"] = ent.loc[mask_vide, "nom_etab"]
+
+    # Liens (Google Maps + PagesJaunes)
+    ent["gmaps_url"] = ent.apply(lambda r: build_gmaps_link(r["lat"], r["lon"], r["nom_affiche"], r["adresse"]), axis=1)
+    ent["pj_url"]    = ent.apply(lambda r: build_pj_link (r["nom_affiche"], r["adresse"], r["cp"], r["commune"]), axis=1)
+
+    # === Contrôles de cohérence post-jointure ===
+    rows_after        = len(ent)
+    siret_uniq_after  = ent["siret"].nunique()
+    siren_uniq_after  = ent["siren"].nunique()
+
+    ok_rows  = (rows_before == rows_after)
+    ok_siret = (siret_uniq_before == siret_uniq_after)
+    ok_siren = (siren_uniq_before == siren_uniq_after)
+
+    if ok_rows and ok_siret and ok_siren:
+        st.success(f"✅ Chargé: {rows_after:,} lignes | SIRET uniques: {siret_uniq_after:,} | SIREN uniques: {siren_uniq_after:,} (aucune perte, aucun doublon).")
+    else:
+        st.error("❌ Incohérence détectée entre avant et après jointure (vérifie les sources UL).")
+        st.write({
+            "rows_before": rows_before, "rows_after": rows_after,
+            "siret_uniq_before": siret_uniq_before, "siret_uniq_after": siret_uniq_after,
+            "siren_uniq_before": siren_uniq_before, "siren_uniq_after": siren_uniq_after,
+        })
+
+    # Échantillonnage pour la carte si énorme
     if len(ent) > 50_000:
         st.warning("Beaucoup de points à afficher. J’affiche un échantillon de 50 000 pour garder la carte fluide.")
         ent = ent.sample(50_000, random_state=1)
@@ -376,15 +490,13 @@ if st.session_state["go"]:
     cluster_ent = MarkerCluster(name="Entreprises").add_to(m)
 
     for _, r in ent.iterrows():
-        pj = build_pj_link(r["nom"], r["adresse"], r["cp"], r["commune"])
-        gm = build_gmaps_link(r["lat"], r["lon"], r["nom"], r["adresse"])
-        popup = f"""<b>{_norm(r.get('nom',''))}</b><br>
+        popup = f"""<b>{_norm(r.get('nom_affiche',''))}</b><br>
         {r.get('adresse','') or ''}<br>
         {(r.get('cp','') or '')} {(r.get('commune','') or '')}<br>
         Dép: {r.get('__dep__','')} | SIRET: {r.get('siret','') or ''}<br>
         NAF: {r.get('naf','') or ''}<br>
-        <a href="{gm}" target="_blank">Google Maps</a> |
-        <a href="{pj}" target="_blank">PagesJaunes</a>"""
+        <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a> |
+        <a href="{r.get('pj_url','')}" target="_blank">PagesJaunes</a>"""
         try:
             folium.Marker([float(r["lat"]), float(r["lon"])],
                           popup=popup,
@@ -410,9 +522,17 @@ if st.session_state["go"]:
 
     # ---------- Export ----------
     st.subheader("6) Export CSV des données affichées")
-    csv_bytes = ent.to_csv(index=False).encode("utf-8")
+    cols_export = [
+        "siret","siren","nom_affiche","nom_ul","nom_etab",
+        "adresse","cp","commune","naf","lat","lon",
+        "__dep__","__source__","gmaps_url","pj_url"
+    ]
+    # ne garde que les colonnes dispo (robuste si certaines manquent)
+    cols_export = [c for c in cols_export if c in ent.columns]
+    csv_bytes = ent[cols_export].to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Télécharger les entreprises (CSV)", data=csv_bytes,
                        file_name="entreprises_filtrees.csv", mime="text/csv")
 
 else:
     st.info("💡 Sélectionne d’abord 1–n départements, saisis (ou scanne) des codes NAF, puis clique *Charger la carte*.")
+
