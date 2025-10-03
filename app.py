@@ -3,6 +3,7 @@ import pandas as pd
 from pathlib import Path
 import re, unicodedata
 from urllib.parse import quote_plus
+from io import BytesIO
 from streamlit_folium import st_folium
 import folium
 from folium.plugins import MarkerCluster
@@ -19,7 +20,7 @@ st.title("🗺️ Carte entreprises par NAF — sélection par département + co
 ROOT     = Path(__file__).parent
 DIR_ENT  = ROOT / "data" / "entreprises"
 DIR_METH = ROOT / "data" / "methaniseurs"
-DIR_UL   = ROOT / "data" / "nomenclatures"   # <-- UL partitions
+DIR_UL   = ROOT / "data" / "unite_legale" / "ul_parts"   # <-- UL partitions
 
 # Colonnes SIRENE (selon tes fichiers entreprises)
 COLS = {
@@ -41,7 +42,7 @@ NEEDED_COLS = [
     COLS["lon"], COLS["lat"], COLS["adresse"], COLS["cp"], COLS["commune"], COLS["siege"]
 ]
 
-DEPT_RE = re.compile(r"geo_siret_([0-9]{2}|[0-9]{3}|2A|2B)", re.IGNORECASE)  # 2ch, DOM à 3ch, 2A/2B
+DEPT_RE = re.compile(r"geo_siret_([0-9]{2}|[0-9]{3}|2A|2B)", re.IGNORECASE)
 
 # ==================== UTILS ====================
 def _norm(s: str):
@@ -49,20 +50,67 @@ def _norm(s: str):
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
     return re.sub(r"[^0-9A-Za-z ]+", " ", s).strip()
 
-def build_pj_link(nom, adresse, cp, commune):
-    # Requête PJ plus tolérante (quoiqui + ou)
-    quoiqui = (nom or "").strip()
-    if not quoiqui:
-        quoiqui = (adresse or "").strip() or (commune or "").strip()
-    ou = " ".join([str(cp or "").strip(), str(commune or "").strip()]).strip()
-    base = "https://www.pagesjaunes.fr/recherche"
-    return f"{base}?quoiqui={quote_plus(quoiqui)}&ou={quote_plus(ou)}"
+def _slugify(s: str) -> str:
+    """Slug pour PagesJaunes: sans accents, minuscule, tirets."""
+    if not isinstance(s, str): return ""
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    s = re.sub(r"[^0-9A-Za-z]+", "-", s).strip("-").lower()
+    s = re.sub(r"-{2,}", "-", s)
+    return s
 
-def build_gmaps_link(lat, lon, nom=None, adresse=None):
+def build_gmaps_fiche(nom, adresse, cp, commune, siret=None):
+    """
+    Lien 'fiche' Google: on force une recherche précise avec "Nom exact" + adresse + CP + commune + SIRET.
+    Ça maximise les chances d’ouvrir directement la fiche établissement.
+    """
+    parts = []
+    if isinstance(nom, str) and nom.strip():
+        parts.append(f'"{nom.strip()}"')  # guillemets = match exact du nom
+    if isinstance(adresse, str) and adresse.strip():
+        parts.append(adresse.strip())
+    if isinstance(cp, str) and cp.strip():
+        parts.append(cp.strip())
+    if isinstance(commune, str) and commune.strip():
+        parts.append(commune.strip())
+    if isinstance(siret, str) and siret.strip():
+        parts.append(f"SIRET {siret.strip()}")
+    q = " ".join(parts) if parts else ""
+    if not q:
+        q = "France"
+    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(q)}"
+
+def build_gmaps_point(lat, lon, nom=None):
+    """Pin direct lat/lon sur Google Maps (secours si la fiche n’est pas reconnue)."""
     if pd.notna(lat) and pd.notna(lon):
         return f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-    q = " ".join([str(x) for x in [nom, adresse] if x])
-    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(q)}"
+    # fallback recherche par nom (si pas de coords)
+    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(str(nom or '').strip())}"
+
+def build_pj_links(nom, adresse, cp, commune):
+    """
+    Deux variantes pour PagesJaunes :
+    - URL 'jolie': /recherche/<ville-dept>/<quoiqui>
+    - URL querystring de secours: ?quoiqui=&ou=
+    On renvoie un tuple (pj_pretty, pj_qs).
+    """
+    nom = (nom or "").strip()
+    adresse = (adresse or "").strip()
+    cp = (str(cp or "")).strip()
+    commune = (commune or "").strip()
+
+    # ville-dept pour slug 'joli' (ex: paris-75, lyon-69)
+    dept = cp[:2] if cp else ""
+    ville_slug = _slugify(commune) + (f"-{dept}" if dept else "")
+    quoiqui_slug = _slugify(nom) if nom else _slugify(adresse) or "entreprise"
+
+    pj_pretty = f"https://www.pagesjaunes.fr/recherche/{ville_slug}/{quoiqui_slug}".rstrip("/")
+
+    # Fallback plus tolérant
+    quoiqui = nom if nom else " ".join([adresse, commune]).strip()
+    ou = " ".join([cp, commune]).strip() or commune or "France"
+    pj_qs = f"https://www.pagesjaunes.fr/recherche?quoiqui={quote_plus(quoiqui)}&ou={quote_plus(ou)}"
+
+    return pj_pretty, pj_qs
 
 def coalesce_name_etab(row):
     for c in (COLS["denom"], COLS["enseigne1"]):
@@ -74,7 +122,6 @@ def coalesce_name_etab(row):
 # ==================== FICHIERS DISPONIBLES ====================
 @st.cache_data(show_spinner=False)
 def files_by_dep():
-    """Retourne {dep: [Paths...]} en groupant toutes les parts/suffixes."""
     files = []
     for ext in (".parquet", ".csv.gz", ".zip", ".csv"):
         files.extend(DIR_ENT.glob(f"geo_siret_*{ext}"))
@@ -89,7 +136,6 @@ def files_by_dep():
 # ==================== DÉCOUVERTE NAF (OPTIONNEL) ====================
 @st.cache_data(show_spinner=True)
 def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
-    """Lit uniquement la colonne NAF des départements sélectionnés (Parquet en pushdown, CSV en échantillon/chunks)."""
     fb = files_by_dep()
     naf = set()
     for dep in selected_deps:
@@ -101,11 +147,7 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
                     t = dset.to_table(columns=[COLS["naf"]])
                     s = pd.Series(t[COLS["naf"]].to_pandas(dtype="string", types_mapper=pd.ArrowDtype))
                     naf.update(
-                        s.astype("string")
-                         .str.upper()
-                         .str.replace(r"[^0-9A-Z.]", "", regex=True)
-                         .dropna()
-                         .unique()
+                        s.astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True).dropna().unique()
                     )
                 elif name.endswith(".csv.gz") or name.endswith(".gz") or name.endswith(".csv") or name.endswith(".zip"):
                     seps = [None, ";", ",", "\t"]; encs = ["utf-8", "latin1"]
@@ -145,22 +187,17 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
 # ==================== CHARGEMENT FILTRÉ (ENTREPRISES) ====================
 def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> pd.DataFrame:
     df = df.copy()
-
     if COLS["etat"] in df.columns:
         df = df[df[COLS["etat"]].astype(str).str.upper().str.startswith("A")]
-
     if naf_set and COLS["naf"] in df.columns:
         naf_clean = df[COLS["naf"]].astype(str).str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
         df = df[naf_clean.isin(list(naf_set))]
-
     if only_siege and COLS["siege"] in df.columns:
         df = df[df[COLS["siege"]].astype(str).isin(["1","True","true","O","Oui"])]
-
     if COLS["lat"] in df.columns and COLS["lon"] in df.columns:
         df.loc[:, COLS["lat"]] = pd.to_numeric(df[COLS["lat"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
         df.loc[:, COLS["lon"]] = pd.to_numeric(df[COLS["lon"]].astype(str).str.replace(",", ".", regex=False), errors="coerce")
         df = df[df[COLS["lat"]].notna() & df[COLS["lon"]].notna()]
-
     return df
 
 def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege: bool) -> pd.DataFrame:
@@ -177,9 +214,7 @@ def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege:
         # 1) Parquet
         pq_files = [str(p) for p in files if p.suffix.lower() == ".parquet"]
         if pq_files:
-            filt = None
-            if naf_set:
-                filt = pc.field(COLS["naf"]).isin(list(naf_set))
+            filt = pc.field(COLS["naf"]).isin(list(naf_set)) if naf_set else None
             dset = ds.dataset(pq_files, format="parquet")
             cols = [c for c in needed if c in dset.schema.names]
             try:
@@ -242,38 +277,24 @@ UL_NAME_COLS = [
 ]
 
 def _best_ul_name(row: pd.Series) -> str:
-    # 1) Personnes morales
-    for c in [
-        "denominationUniteLegale",
-        "denominationUsuelle1UniteLegale",
-        "denominationUsuelle2UniteLegale",
-        "denominationUsuelle3UniteLegale",
-        "sigleUniteLegale",
-    ]:
+    for c in ["denominationUniteLegale","denominationUsuelle1UniteLegale","denominationUsuelle2UniteLegale","denominationUsuelle3UniteLegale","sigleUniteLegale"]:
         v = row.get(c)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    # 2) Personnes physiques
     prenom = (row.get("prenom1UniteLegale") or row.get("prenomUsuelUniteLegale") or "").strip()
     nom    = (row.get("nomUsageUniteLegale") or row.get("nomUniteLegale") or "").strip()
     if nom or prenom:
         return (prenom + " " + nom).strip()
-    # 3) Repli
     v = row.get("pseudonymeUniteLegale")
     return (v or "").strip()
 
 @st.cache_data(show_spinner=False)
 def load_ul_names_for(sirens: list[str]) -> pd.DataFrame:
-    """
-    Charge 'siren' + colonnes nom depuis data/unite_legale/ul_parts/*.parquet,
-    filtré sur les SIREN demandés. Retour: ['siren','nom_ul'] (unique par siren).
-    """
     if not sirens:
         return pd.DataFrame(columns=["siren","nom_ul"])
     if not DIR_UL.exists():
         st.warning("Dossier data/unite_legale/ul_parts introuvable.")
         return pd.DataFrame(columns=["siren","nom_ul"])
-
     parts = sorted(DIR_UL.glob("*.parquet"))
     if not parts:
         st.warning("Aucun fichier parquet dans data/unite_legale/ul_parts.")
@@ -295,9 +316,8 @@ def load_ul_names_for(sirens: list[str]) -> pd.DataFrame:
 
     if not frames:
         return pd.DataFrame(columns=["siren","nom_ul"])
-
     out = pd.concat(frames, ignore_index=True)
-    out = out.drop_duplicates(subset=["siren"], keep="first")  # évite toute duplication à la jointure
+    out = out.drop_duplicates(subset=["siren"], keep="first")
     return out
 
 # ==================== METHANISEURS ====================
@@ -334,7 +354,7 @@ def load_methaniseurs():
     dfm = dfm[dfm["lat"].notna() & dfm["lon"].notna()].copy()
     if c_nom and "nom" not in dfm.columns: dfm.rename(columns={c_nom:"nom"}, inplace=True)
     if c_addr and "adresse" not in dfm.columns: dfm.rename(columns={c_addr:"adresse"}, inplace=True)
-    dfm["gmaps_url"] = dfm.apply(lambda r: build_gmaps_link(r.get("lat"), r.get("lon"), r.get("nom"), r.get("adresse")), axis=1)
+    dfm["gmaps_url"] = dfm.apply(lambda r: build_gmaps_point(r.get("lat"), r.get("lon"), r.get("nom")), axis=1)
     keep = [c for c in ["nom","adresse","lat","lon","gmaps_url"] if c in dfm.columns]
     return dfm[keep].copy()
 
@@ -426,11 +446,10 @@ if st.session_state["go"]:
         "__source__": df["__source__"],
     })
 
-    # Comptes avant jointure (contrôle pertes / doublons)
+    # Contrôles avant jointure
     rows_before        = len(ent)
     siret_uniq_before  = ent["siret"].nunique()
-    # SIREN (9 premiers caractères, robustesse si siret < 9 chars)
-    ent["siren"] = ent["siret"].str.slice(0, 9)
+    ent["siren"]       = ent["siret"].str.slice(0, 9)
     siren_uniq_before  = ent["siren"].nunique()
 
     # === Jointure UL ===
@@ -445,11 +464,14 @@ if st.session_state["go"]:
     mask_vide = ent["nom_affiche"].isna() | (ent["nom_affiche"].astype(str).str.strip()=="")
     ent.loc[mask_vide, "nom_affiche"] = ent.loc[mask_vide, "nom_etab"]
 
-    # Liens (Google Maps + PagesJaunes)
-    ent["gmaps_url"] = ent.apply(lambda r: build_gmaps_link(r["lat"], r["lon"], r["nom_affiche"], r["adresse"]), axis=1)
-    ent["pj_url"]    = ent.apply(lambda r: build_pj_link (r["nom_affiche"], r["adresse"], r["cp"], r["commune"]), axis=1)
+    # Liens (Google Maps + PagesJaunes) — version fiche + secours
+    ent["gmaps_fiche"] = ent.apply(lambda r: build_gmaps_fiche(r["nom_affiche"], r["adresse"], r["cp"], r["commune"], r["siret"]), axis=1)
+    ent["gmaps_point"] = ent.apply(lambda r: build_gmaps_point(r["lat"], r["lon"], r["nom_affiche"]), axis=1)
+    pj_links = ent.apply(lambda r: build_pj_links(r["nom_affiche"], r["adresse"], r["cp"], r["commune"]), axis=1, result_type="expand")
+    ent["pj_url"]     = pj_links[0]  # jolie
+    ent["pj_url_qs"]  = pj_links[1]  # fallback
 
-    # === Contrôles de cohérence post-jointure ===
+    # Contrôles post-jointure
     rows_after        = len(ent)
     siret_uniq_after  = ent["siret"].nunique()
     siren_uniq_after  = ent["siren"].nunique()
@@ -467,11 +489,6 @@ if st.session_state["go"]:
             "siret_uniq_before": siret_uniq_before, "siret_uniq_after": siret_uniq_after,
             "siren_uniq_before": siren_uniq_before, "siren_uniq_after": siren_uniq_after,
         })
-
-    # Échantillonnage pour la carte si énorme
-    if len(ent) > 50_000:
-        st.warning("Beaucoup de points à afficher. J’affiche un échantillon de 50 000 pour garder la carte fluide.")
-        ent = ent.sample(50_000, random_state=1)
 
     # ---------- Couche Méthaniseurs ----------
     st.subheader("4) Couche optionnelle : Méthaniseurs")
@@ -495,8 +512,10 @@ if st.session_state["go"]:
         {(r.get('cp','') or '')} {(r.get('commune','') or '')}<br>
         Dép: {r.get('__dep__','')} | SIRET: {r.get('siret','') or ''}<br>
         NAF: {r.get('naf','') or ''}<br>
-        <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a> |
-        <a href="{r.get('pj_url','')}" target="_blank">PagesJaunes</a>"""
+        <a href="{r.get('gmaps_fiche','')}" target="_blank">Google (fiche)</a> |
+        <a href="{r.get('gmaps_point','')}" target="_blank">Google (point)</a> |
+        <a href="{r.get('pj_url','')}" target="_blank">PagesJaunes</a> |
+        <a href="{r.get('pj_url_qs','')}" target="_blank">PJ (recherche)</a>"""
         try:
             folium.Marker([float(r["lat"]), float(r["lon"])],
                           popup=popup,
@@ -520,18 +539,29 @@ if st.session_state["go"]:
     folium.LayerControl(collapsed=False).add_to(m)
     st_folium(m, width=1200, height=700)
 
-    # ---------- Export ----------
+    # ---------- Export CSV ----------
     st.subheader("6) Export CSV des données affichées")
     cols_export = [
         "siret","siren","nom_affiche","nom_ul","nom_etab",
         "adresse","cp","commune","naf","lat","lon",
-        "__dep__","__source__","gmaps_url","pj_url"
+        "__dep__","__source__",
+        "gmaps_fiche","gmaps_point","pj_url","pj_url_qs"
     ]
-    # ne garde que les colonnes dispo (robuste si certaines manquent)
     cols_export = [c for c in cols_export if c in ent.columns]
     csv_bytes = ent[cols_export].to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Télécharger les entreprises (CSV)", data=csv_bytes,
                        file_name="entreprises_filtrees.csv", mime="text/csv")
+
+    # ---------- Export CARTE HTML ----------
+    st.subheader("7) Exporter la carte (HTML)")
+    # Rend tout le HTML (incl. clusters et popups). Pas besoin d’écrire un fichier temporaire.
+    html_str = m.get_root().render()
+    st.download_button(
+        "🗺️ Télécharger la carte (HTML)",
+        data=html_str.encode("utf-8"),
+        file_name="carte_entreprises.html",
+        mime="text/html"
+    )
 
 else:
     st.info("💡 Sélectionne d’abord 1–n départements, saisis (ou scanne) des codes NAF, puis clique *Charger la carte*.")
