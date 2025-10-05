@@ -519,6 +519,12 @@ def load_methaniseurs():
     return dfm[keep].copy()
 
 # ==================== UI ====================
+# --- état UI par défaut (évite les KeyError au 1er run) ---
+if "go" not in st.session_state:
+    st.session_state["go"] = False
+if "naf_options" not in st.session_state:
+    st.session_state["naf_options"] = []
+
 fb = files_by_dep()
 if not fb:
     st.error("Aucun fichier trouvé dans data/entreprises/ (ex: geo_siret_01.parquet).")
@@ -601,6 +607,9 @@ naf_typed = [c for c in naf_typed if c]
 naf_final = sorted(set(naf_typed) | set(naf_select_ms) | set(naf_from_div))
 st.caption(f"🧩 Codes NAF retenus ({len(naf_final)}): {', '.join(naf_final) if naf_final else '—'}")
 
+# 2bis) Options de filtrage
+only_siege = st.checkbox("Ne garder que les sièges (etablissementSiege=1)", value=False)
+
 
 st.subheader("3) Charger les données filtrées")
 col_go, col_reset = st.columns([1,1])
@@ -613,7 +622,7 @@ with col_reset:
         st.session_state["naf_options"] = []
 
 # ==================== RUN ====================
-if st.session_state["go"]:
+if st.session_state.get("go", False):
     if not selected_deps:
         st.warning("Sélectionne au moins un département.")
         st.stop()
