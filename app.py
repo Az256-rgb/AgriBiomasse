@@ -44,6 +44,166 @@ NEEDED_COLS = [
 
 DEPT_RE = re.compile(r"geo_siret_([0-9]{2}|[0-9]{3}|2A|2B)", re.IGNORECASE)
 
+# ---------- NAF (Division -> sous-classes) ----------
+NAF_DIVISIONS = {
+    "01 — Culture et production animale, chasse et services annexes": [
+        ("0111Z", "Culture de céréales (à l'exception du riz), de légumineuses et de graines oléagineuses"),
+        ("0112Z", "Culture du riz"),
+        ("0113Z", "Culture de légumes, de melons, de racines et de tubercules"),
+        ("0114Z", "Culture de la canne à sucre"),
+        ("0115Z", "Culture du tabac"),
+        ("0116Z", "Culture de plantes à fibres"),
+        ("0119Z", "Autres cultures non permanentes"),
+        ("0121Z", "Culture de la vigne"),
+        ("0122Z", "Culture de fruits tropicaux et subtropicaux"),
+        ("0123Z", "Culture d'agrumes"),
+        ("0124Z", "Culture de fruits à pépins et à noyau"),
+        ("0125Z", "Culture d'autres fruits d'arbres ou d'arbustes et de fruits à coque"),
+        ("0126Z", "Culture de fruits oléagineux"),
+        ("0127Z", "Culture de plantes à boissons"),
+        ("0128Z", "Culture de plantes à épices, aromatiques, médicinales et pharmaceutiques"),
+        ("0129Z", "Autres cultures permanentes"),
+        ("0130Z", "Reproduction de plantes"),
+        ("0141Z", "Élevage de vaches laitières"),
+        ("0142Z", "Élevage d'autres bovins et de buffles"),
+        ("0143Z", "Élevage de chevaux et d'autres équidés"),
+        ("0144Z", "Élevage de chameaux et d'autres camélidés"),
+        ("0145Z", "Élevage d'ovins et de caprins"),
+        ("0146Z", "Élevage de porcins"),
+        ("0147Z", "Élevage de volailles"),
+        ("0149Z", "Élevage d'autres animaux"),
+        ("0150Z", "Culture et élevage associés"),
+        ("0161Z", "Activités de soutien aux cultures"),
+        ("0162Z", "Activités de soutien à la production animale"),
+        ("0163Z", "Traitement primaire des récoltes"),
+        ("0164Z", "Traitement des semences"),
+        ("0170Z", "Chasse, piégeage et services annexes"),
+    ],
+    "02 — Sylviculture et exploitation forestière": [
+        ("0210Z", "Sylviculture et autres activités forestières"),
+        ("0220Z", "Exploitation forestière"),
+        ("0230Z", "Récolte de produits forestiers non ligneux poussant à l'état sauvage"),
+        ("0240Z", "Services de soutien à l'exploitation forestière"),
+    ],
+    "03 — Pêche et aquaculture": [
+        ("0311Z", "Pêche en mer"),
+        ("0312Z", "Pêche en eau douce"),
+        ("0321Z", "Aquaculture en mer"),
+        ("0322Z", "Aquaculture en eau douce"),
+    ],
+    "10 — Industries alimentaires": [
+        ("1011Z", "Transformation et conservation de la viande de boucherie"),
+        ("1012Z", "Transformation et conservation de la viande de volaille"),
+        ("1013A", "Préparation industrielle de produits à base de viande"),
+        ("1013B", "Charcuterie"),
+        ("1020Z", "Transformation et conservation de poisson, de crustacés et de mollusques"),
+        ("1031Z", "Transformation et conservation de pommes de terre"),
+        ("1032Z", "Préparation de jus de fruits et légumes"),
+        ("1039A", "Autre transformation et conservation de légumes"),
+        ("1039B", "Transformation et conservation de fruits"),
+        ("1041B", "Fabrication d'huiles et graisses raffinées"),
+        ("1042Z", "Fabrication de margarine et graisses comestibles similaires"),
+        ("1051A", "Fabrication de lait liquide et de produits frais"),
+        ("1051B", "Fabrication de beurre"),
+        ("1051C", "Fabrication de fromage"),
+        ("1051D", "Fabrication d'autres produits laitiers"),
+        ("1052Z", "Fabrication de glaces et sorbets"),
+        ("1061A", "Meunerie"),
+        ("1061B", "Autres activités du travail des grains"),
+        ("1062Z", "Fabrication de produits amylacés"),
+        ("1071A", "Fabrication industrielle de pain et de pâtisserie fraîche"),
+        ("1071B", "Cuisson de produits de boulangerie"),
+        ("1071C", "Boulangerie et boulangerie-pâtisserie"),
+        ("1071D", "Pâtisserie"),
+        ("1072Z", "Fabrication de biscuits, biscottes et pâtisseries de conservation"),
+        ("1073Z", "Fabrication de pâtes alimentaires"),
+        ("1081Z", "Fabrication de sucre"),
+        ("1082Z", "Fabrication de cacao, chocolat et de produits de confiserie"),
+        ("1083Z", "Transformation du thé et du café"),
+        ("1084Z", "Fabrication de condiments et assaisonnements"),
+        ("1085Z", "Fabrication de plats préparés"),
+        ("1086Z", "Fabrication d'aliments homogénéisés et diététiques"),
+        ("1089Z", "Fabrication d'autres produits alimentaires n.c.a."),
+        ("1091Z", "Fabrication d'aliments pour animaux de ferme"),
+        ("1092Z", "Fabrication d'aliments pour animaux de compagnie"),
+    ],
+    "11 — Fabrication de boissons": [
+        ("1101Z", "Production de boissons alcooliques distillées"),
+        ("1102A", "Fabrication de vins effervescents"),
+        ("1102B", "Vinification"),
+        ("1103Z", "Fabrication de cidre et de vins de fruits"),
+        ("1104Z", "Production d'autres boissons fermentées non distillées"),
+        ("1105Z", "Fabrication de bière"),
+        ("1106Z", "Fabrication de malt"),
+        ("1107A", "Industrie des eaux de table"),
+        ("1107B", "Production de boissons rafraîchissantes"),
+    ],
+    "16 — Travail du bois, liège, vannerie, sparterie (hors meubles)": [
+        ("1610A", "Sciage et rabotage du bois, hors imprégnation"),
+        ("1610B", "Imprégnation du bois"),
+        ("1621Z", "Fabrication de placage et de panneaux de bois"),
+        ("1622Z", "Fabrication de parquets assemblés"),
+        ("1623Z", "Fabrication de charpentes et d'autres menuiseries"),
+        ("1624Z", "Fabrication d'emballages en bois"),
+        ("1629Z", "Objets en bois, liège, vannerie et sparterie"),
+    ],
+    "17 — Industrie du papier et du carton": [
+        ("1711Z", "Fabrication de pâte à papier"),
+        ("1712Z", "Fabrication de papier et de carton"),
+        ("1721A", "Fabrication de carton ondulé"),
+        ("1721B", "Fabrication de cartonnages"),
+        ("1721C", "Fabrication d'emballages en papier"),
+        ("1722Z", "Articles en papier à usage sanitaire ou domestique"),
+        ("1723Z", "Articles de papeterie"),
+        ("1724Z", "Papiers peints"),
+        ("1729Z", "Autres articles en papier ou en carton"),
+    ],
+    "31 — Fabrication de meubles": [
+        ("3101Z", "Meubles de bureau et de magasin"),
+        ("3102Z", "Meubles de cuisine"),
+        ("3103Z", "Matelas"),
+        ("3109A", "Sièges d'ameublement d'intérieur"),
+        ("3109B", "Autres meubles et industries connexes"),
+    ],
+    "35 — Électricité, gaz, vapeur et air conditionné": [
+        ("3521Z", "Production de combustibles gazeux"),
+    ],
+    "38 — Déchets : collecte, traitement, élimination, récupération": [
+        ("3811Z", "Collecte des déchets non dangereux"),
+        ("3812Z", "Collecte des déchets dangereux"),
+        ("3821Z", "Traitement et élimination des déchets non dangereux"),
+        ("3822Z", "Traitement et élimination des déchets dangereux"),
+        ("3831Z", "Démantèlement d'épaves"),
+        ("3832Z", "Récupération de déchets triés"),
+    ],
+    "46 — Commerce de gros (sauf auto/moto)": [
+        ("4611Z", "Intermédiaires du commerce (MP agricoles, animaux, textiles, semi-finis)"),
+        ("4617A", "Centrales d'achat alimentaires"),
+        ("4613Z", "Intermédiaires commerce de gros en bois et matériaux de construction"),
+        ("4631Z", "Commerce de gros de fruits et légumes"),
+        ("4621Z", "Gros de céréales, tabac non manufacturé, semences, aliments pour bétail"),
+        ("4633Z", "Gros de produits laitiers, œufs, huiles et matières grasses comestibles"),
+        ("4639B", "Gros alimentaire non spécialisé"),
+        ("4673A", "Gros de bois et matériaux de construction"),
+        ("4677Z", "Gros de déchets et débris"),
+    ],
+    "47 — Commerce de détail (sauf auto/moto)": [
+        ("4711B", "Commerce d'alimentation générale"),
+        ("4711F", "Hypermarchés"),
+        ("4721Z", "Détail de fruits et légumes en magasin spécialisé"),
+        ("4781Z", "Détail alimentaire sur éventaires et marchés"),
+    ],
+    "56 — Restauration": [
+        ("5610A", "Restauration traditionnelle"),
+        ("5610B", "Cafétérias et autres libres-services"),
+        ("5610C", "Restauration de type rapide"),
+        ("5621Z", "Services des traiteurs"),
+        ("5629A", "Restauration collective sous contrat"),
+        ("5629B", "Autres services de restauration n.c.a."),
+    ],
+}
+
+
 # ==================== UTILS ====================
 def _norm(s: str):
     if not isinstance(s, str): return ""
@@ -372,8 +532,9 @@ selected_deps = st.multiselect(
     options=all_deps,
     default=[],
 )
-
 st.subheader("2) Codes NAF")
+
+# --- A) Saisie libre + Scan (inchangé) ---
 colA, colB = st.columns([2,1])
 with colA:
     naf_input = st.text_input("Saisis des codes NAF (séparés par des virgules)", value="")
@@ -396,14 +557,50 @@ naf_select_ms = st.multiselect(
     default=[]
 )
 
+# --- B) Sélection par Division → Secteurs ---
+st.markdown("**Sélection guidée par Division / Secteurs (codes NAF avec libellés)**")
+colD, colS = st.columns([1,2])
+with colD:
+    divisions_sel = st.multiselect(
+        "Division(s) (tu peux en choisir plusieurs)",
+        options=list(NAF_DIVISIONS.keys()),
+        default=[]
+    )
+
+# liste des options (code, libellé) en fonction des divisions choisies
+sect_options = []
+for d in divisions_sel:
+    sect_options.extend(NAF_DIVISIONS.get(d, []))
+
+# dédoublonner par code en gardant le 1er libellé rencontré
+code2label = {}
+for code, label in sect_options:
+    if code not in code2label:
+        code2label[code] = label
+sect_options_unique = [(c, l) for c, l in sorted(code2label.items())]
+
+with colS:
+    secteurs_sel = st.multiselect(
+        "Sous-classes NAF (des divisions sélectionnées)",
+        options=sect_options_unique,
+        format_func=lambda x: f"{x[0]} — {x[1]}",
+        default=[]
+    )
+
+# Option "tout prendre" pour les divisions cochées
+take_all = False
+if divisions_sel and sect_options_unique:
+    take_all = st.checkbox("Sélectionner toutes les sous-classes des divisions choisies")
+
+naf_from_div = [c for (c, _) in sect_options_unique] if take_all else [c for (c, _) in secteurs_sel]
+
+# --- Fusion des 3 sources : saisie libre + scan + divisions/secteurs ---
 naf_typed = [re.sub(r"[^0-9A-Z.]", "", c.upper()) for c in naf_input.split(",")]
 naf_typed = [c for c in naf_typed if c]
-naf_final = sorted(set(naf_typed) | set(naf_select_ms))
 
-only_siege = st.checkbox("Ne garder que les sièges (etablissementSiege=1)", value=False)
+naf_final = sorted(set(naf_typed) | set(naf_select_ms) | set(naf_from_div))
+st.caption(f"🧩 Codes NAF retenus ({len(naf_final)}): {', '.join(naf_final) if naf_final else '—'}")
 
-if "go" not in st.session_state:
-    st.session_state["go"] = False
 
 st.subheader("3) Charger les données filtrées")
 col_go, col_reset = st.columns([1,1])
