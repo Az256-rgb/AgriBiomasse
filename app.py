@@ -450,35 +450,95 @@ def _best_ul_name(row: pd.Series) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_ul_names_for(sirens: list[str]) -> pd.DataFrame:
-    if not sirens:
-        return pd.DataFrame(columns=["siren","nom_ul"])
-    if not DIR_UL.exists():
-        st.warning("Dossier data/unite_legale/ul_parts introuvable.")
-        return pd.DataFrame(columns=["siren","nom_ul"])
-    parts = sorted(DIR_UL.glob("*.parquet"))
+    """
+    Récupère nom UL par SIREN avec détection de type:
+    - Si 'siren' UL est un entier → on filtre en INT (leading zeros disparaissent côté UL).
+    - Si 'siren' UL est une string → on filtre en string + on tolère les variantes sans leading zero.
+    On renvoie: ['siren','nom_ul','statutDiffusionUniteLegale','unitePurgeeUniteLegale'] (siren zfill(9)).
+    """
+    if not sirens or not DIR_UL.exists():
+        return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
+
+    parts = [str(p) for p in sorted(DIR_UL.glob("*.parquet"))]
     if not parts:
-        st.warning("Aucun fichier parquet dans data/unite_legale/ul_parts.")
-        return pd.DataFrame(columns=["siren","nom_ul"])
+        return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
-    dset = ds.dataset([str(p) for p in parts], format="parquet")
-    cols = ["siren"] + [c for c in UL_NAME_COLS if c in dset.schema.names]
+    dset = ds.dataset(parts, format="parquet")
+    schema = dset.schema
+    if "siren" not in schema.names:
+        # sécurité : rien à faire si la colonne n'existe pas
+        return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
-    CHUNK = 50_000
-    frames = []
+    t = schema.field("siren").type
+    UL_cols_wanted = [
+        "denominationUniteLegale","denominationUsuelle1UniteLegale","denominationUsuelle2UniteLegale",
+        "denominationUsuelle3UniteLegale","sigleUniteLegale","nomUsageUniteLegale","nomUniteLegale",
+        "prenom1UniteLegale","prenomUsuelUniteLegale","pseudonymeUniteLegale",
+        "statutDiffusionUniteLegale","unitePurgeeUniteLegale"
+    ]
+    cols = ["siren"] + [c for c in UL_cols_wanted if c in schema.names]
+
+    # Sirens normalisés côté app
+    sirens = [re.sub(r"\D", "", s or "")[:9] for s in sirens]
+    sirens = [s.zfill(9) for s in sirens if s]
+
+    CHUNK = 60_000
+    out = []
+    # utilitaires nom
+    def best_name(df):
+        nom = (
+            df.get("denominationUniteLegale").fillna("")
+              .replace(r"^\s*$", pd.NA, regex=True)
+              .fillna(df.get("denominationUsuelle1UniteLegale"))
+              .fillna(df.get("denominationUsuelle2UniteLegale"))
+              .fillna(df.get("denominationUsuelle3UniteLegale"))
+              .fillna(df.get("sigleUniteLegale"))
+        )
+        prenom = df.get("prenom1UniteLegale", "").fillna("")
+        nompp  = df.get("nomUsageUniteLegale", df.get("nomUniteLegale", "")).fillna("")
+        nom = nom.fillna((prenom + " " + nompp).str.strip()).replace("", pd.NA)
+        nom = nom.fillna(df.get("pseudonymeUniteLegale"))
+        return nom
+
     for i in range(0, len(sirens), CHUNK):
         chunk = sirens[i:i+CHUNK]
-        filt = pc.field("siren").isin(pa.array(chunk, type=pa.string()))
-        tbl  = dset.to_table(columns=cols, filter=filt)
-        df   = tbl.to_pandas()
-        if not df.empty:
-            df["nom_ul"] = df.apply(_best_ul_name, axis=1)
-            frames.append(df[["siren","nom_ul"]])
 
-    if not frames:
-        return pd.DataFrame(columns=["siren","nom_ul"])
-    out = pd.concat(frames, ignore_index=True)
-    out = out.drop_duplicates(subset=["siren"], keep="first")
-    return out
+        # filtre selon type UL
+        if pa.types.is_integer(t):
+            # UL.siren = INT → convertir chunk en entiers (perte de zéros assumée pour matcher)
+            ints = []
+            for s in chunk:
+                try:
+                    ints.append(int(s))  # "012345678" -> 12345678
+                except Exception:
+                    pass
+            if not ints:
+                continue
+            f = ds.field("siren").isin(pa.array(ints, type=t))
+        else:
+            # UL.siren = STRING → tolère les deux formes (zfilled et sans leading zeros)
+            variants = list({*chunk, *[s.lstrip("0") or "0" for s in chunk]})
+            f = ds.field("siren").cast(pa.string()).isin(pa.array(variants, type=pa.string()))
+
+        tbl = dset.to_table(columns=cols, filter=f)
+        if tbl.num_rows == 0:
+            continue
+        df = tbl.to_pandas()
+
+        # Harmonise 'siren' UL en 9 chiffres (string) pour la merge
+        df["siren"] = (
+            df["siren"].astype("string")
+              .str.replace(r"\D", "", regex=True)
+              .str.zfill(9).str[:9]
+        )
+        df["nom_ul"] = best_name(df)
+        out.append(df[["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"]])
+
+    if not out:
+        return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
+
+    res = pd.concat(out, ignore_index=True).drop_duplicates("siren", keep="first")
+    return res
 
 # ==================== METHANISEURS ====================
 def _find_meth_file() -> Path | None:
@@ -639,18 +699,25 @@ if st.session_state.get("go", False):
     df.loc[:, "lat"] = pd.to_numeric(df[COLS["lat"]], errors="coerce")
     df.loc[:, "lon"] = pd.to_numeric(df[COLS["lon"]], errors="coerce")
 
+    # Normalisation SIRET → SIREN (évite pertes de zéros, formats bizarres)
+    siret_str = (
+        df.get(COLS["siret"], "").astype("string")
+          .str.replace(r"\D", "", regex=True)  # garde chiffres only
+          .str.zfill(14).str[:14]
+    )
     ent = pd.DataFrame({
-        "siret":    df.get(COLS["siret"], "").astype(str),
+        "siret":    siret_str,
         "nom_etab": df.apply(coalesce_name_etab, axis=1),
         "adresse":  df.get(COLS["adresse"], ""),
         "cp":       df.get(COLS["cp"], "").astype(str),
         "commune":  df.get(COLS["commune"], ""),
         "naf":      df.get(COLS["naf"], ""),
-        "lat":      df["lat"],
-        "lon":      df["lon"],
+        "lat":      pd.to_numeric(df["lat"], errors="coerce"),
+        "lon":      pd.to_numeric(df["lon"], errors="coerce"),
         "__dep__":  df["__dep__"],
         "__source__": df["__source__"],
     })
+    ent["siren"] = ent["siret"].str[:9].str.zfill(9)
 
     # Contrôles avant jointure
     rows_before        = len(ent)
@@ -664,6 +731,27 @@ if st.session_state.get("go", False):
         ul = load_ul_names_for(sirens_need)  # ['siren','nom_ul'] unique
 
     ent = ent.merge(ul, on="siren", how="left")
+
+    ent["nom_affiche"] = (
+        ent["nom_ul"].fillna("")
+        .replace(r"^\s*$", pd.NA, regex=True)
+        .fillna(ent["nom_etab"])
+    )
+    ent["nom_affiche"] = ent["nom_affiche"].fillna("Nom non diffusible")
+
+# Diagnostic utile
+ul_vide = ent["nom_ul"].isna() | (ent["nom_ul"].astype(str).str.strip() == "")
+non_O   = (ent.get("statutDiffusionUniteLegale")  # peut ne pas exister si pas dans UL
+             .astype(str).ne("O") if "statutDiffusionUniteLegale" in ent.columns else (ul_vide & False))
+ul_purg = (ent.get("unitePurgeeUniteLegale")
+             .astype(str).isin(["true","True","1"]) if "unitePurgeeUniteLegale" in ent.columns else (ul_vide & False))
+
+st.caption(
+    f"🔎 UL sans nom: {int(ul_vide.sum()):,} | "
+    f"non-diffusibles: {int((ul_vide & non_O).sum()):,} | "
+    f"UL purgées: {int((ul_vide & ul_purg).sum()):,} | "
+    f"taux de match UL: {1 - (ul_vide.sum()/max(len(ent),1)):.1%}"
+)
 
     # Nom final : priorité UL, repli sur établissement
     ent["nom_affiche"] = ent["nom_ul"]
