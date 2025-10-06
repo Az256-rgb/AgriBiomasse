@@ -732,12 +732,12 @@ if st.session_state.get("go", False):
 
     ent = ent.merge(ul, on="siren", how="left")
 
-    ent["nom_affiche"] = (
-        ent["nom_ul"].fillna("")
-        .replace(r"^\s*$", pd.NA, regex=True)
-        .fillna(ent["nom_etab"])
-    )
-    ent["nom_affiche"] = ent["nom_affiche"].fillna("Nom non diffusible")
+ent["nom_affiche"] = (
+    ent["nom_ul"].fillna("")
+    .replace(r"^\s*$", pd.NA, regex=True)
+    .fillna(ent["nom_etab"])
+)
+ent["nom_affiche"] = ent["nom_affiche"].fillna("Nom non diffusible")
 
 # Diagnostic utile
 ul_vide = ent["nom_ul"].isna() | (ent["nom_ul"].astype(str).str.strip() == "")
