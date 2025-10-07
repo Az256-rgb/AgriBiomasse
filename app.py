@@ -732,26 +732,26 @@ if st.session_state.get("go", False):
 
     ent = ent.merge(ul, on="siren", how="left")
 
-# ✅ À GARDER (une seule fois)
-ent["nom_affiche"] = (
-    ent["nom_ul"].fillna("")
-    .replace(r"^\s*$", pd.NA, regex=True)
-    .fillna(ent["nom_etab"])
-).fillna("Nom non diffusible")
+    # ✅ À GARDER (une seule fois)
+    ent["nom_affiche"] = (
+        ent["nom_ul"].fillna("")
+        .replace(r"^\s*$", pd.NA, regex=True)
+        .fillna(ent["nom_etab"])
+    ).fillna("Nom non diffusible")
 
-# Diagnostic utile
-ul_vide = ent["nom_ul"].isna() | (ent["nom_ul"].astype(str).str.strip() == "")
-non_O   = (ent.get("statutDiffusionUniteLegale")  # peut ne pas exister si pas dans UL
-             .astype(str).ne("O") if "statutDiffusionUniteLegale" in ent.columns else (ul_vide & False))
-ul_purg = (ent.get("unitePurgeeUniteLegale")
-             .astype(str).isin(["true","True","1"]) if "unitePurgeeUniteLegale" in ent.columns else (ul_vide & False))
+    # Diagnostic utile
+    ul_vide = ent["nom_ul"].isna() | (ent["nom_ul"].astype(str).str.strip() == "")
+    non_O   = (ent.get("statutDiffusionUniteLegale")  # peut ne pas exister si pas dans UL
+                 .astype(str).ne("O") if "statutDiffusionUniteLegale" in ent.columns else (ul_vide & False))
+    ul_purg = (ent.get("unitePurgeeUniteLegale")
+                 .astype(str).isin(["true","True","1"]) if "unitePurgeeUniteLegale" in ent.columns else (ul_vide & False))
 
-st.caption(
-    f"🔎 UL sans nom: {int(ul_vide.sum()):,} | "
-    f"non-diffusibles: {int((ul_vide & non_O).sum()):,} | "
-    f"UL purgées: {int((ul_vide & ul_purg).sum()):,} | "
-    f"taux de match UL: {1 - (ul_vide.sum()/max(len(ent),1)):.1%}"
-)
+    st.caption(
+        f"🔎 UL sans nom: {int(ul_vide.sum()):,} | "
+        f"non-diffusibles: {int((ul_vide & non_O).sum()):,} | "
+        f"UL purgées: {int((ul_vide & ul_purg).sum()):,} | "
+        f"taux de match UL: {1 - (ul_vide.sum()/max(len(ent),1)):.1%}"
+    )
 
     # Liens (Google Maps + PagesJaunes) — version fiche + secours
     ent["gmaps_fiche"] = ent.apply(lambda r: build_gmaps_fiche(r["nom_affiche"], r["adresse"], r["cp"], r["commune"], r["siret"]), axis=1)
