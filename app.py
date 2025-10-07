@@ -205,6 +205,11 @@ NAF_DIVISIONS = {
 
 
 # ==================== UTILS ====================
+def canon_naf(x) -> str:
+    if not isinstance(x, str):
+        x = "" if x is None else str(x)
+    return re.sub(r"[^0-9A-Z]", "", x.upper())  # retire les points etc.
+
 def _norm(s: str):
     if not isinstance(s, str): return ""
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
@@ -305,10 +310,15 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
                 if name.endswith(".parquet"):
                     dset = ds.dataset([str(f)], format="parquet")
                     t = dset.to_table(columns=[COLS["naf"]])
-                    s = pd.Series(t[COLS["naf"]].to_pandas(dtype="string", types_mapper=pd.ArrowDtype))
+                    s = pd.Series(t[COLS["naf"]].to_pandas())
                     naf.update(
-                        s.astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True).dropna().unique()
+                        s.astype("string").map(canon_naf).dropna().unique()
                     )
+
+                    ###s = pd.Series(t[COLS["naf"]].to_pandas(dtype="string", types_mapper=pd.ArrowDtype))
+                    ###naf.update(
+                        ###s.astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True).dropna().unique()
+                    ###)
                 elif name.endswith(".csv.gz") or name.endswith(".gz") or name.endswith(".csv") or name.endswith(".zip"):
                     seps = [None, ";", ",", "\t"]; encs = ["utf-8", "latin1"]
                     read_ok = False
@@ -327,8 +337,12 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
                                 it = pd.read_csv(f, chunksize=150_000, **kw)
                                 cnt = 0
                                 for ch in it:
-                                    s = ch[COLS["naf"]].astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
-                                    naf.update(s.dropna().unique())
+                                    ###s = ch[COLS["naf"]].astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
+                                    ###naf.update(s.dropna().unique())
+                                    s = ch[COLS["naf"]].astype("string").map(canon_naf)
+                                    naf.update(
+                                        s.dropna().unique()
+                                    )
                                     cnt += len(ch)
                                     if cnt >= 600_000:
                                         break
@@ -350,7 +364,9 @@ def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> 
     if COLS["etat"] in df.columns:
         df = df[df[COLS["etat"]].astype(str).str.upper().str.startswith("A")]
     if naf_set and COLS["naf"] in df.columns:
-        naf_clean = df[COLS["naf"]].astype(str).str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
+        ###naf_clean = df[COLS["naf"]].astype(str).str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
+        ###df = df[naf_clean.isin(list(naf_set))]
+        naf_clean = df[COLS["naf"]].astype(str).map(canon_naf)
         df = df[naf_clean.isin(list(naf_set))]
     if only_siege and COLS["siege"] in df.columns:
         df = df[df[COLS["siege"]].astype(str).isin(["1","True","true","O","Oui"])]
@@ -661,10 +677,18 @@ if divisions_sel and sect_options_unique:
 naf_from_div = [c for (c, _) in sect_options_unique] if take_all else [c for (c, _) in secteurs_sel]
 
 # --- Fusion des 3 sources : saisie libre + scan + divisions/secteurs ---
-naf_typed = [re.sub(r"[^0-9A-Z.]", "", c.upper()) for c in naf_input.split(",")]
-naf_typed = [c for c in naf_typed if c]
+# (1) saisie libre
+naf_typed = [canon_naf(c) for c in naf_input.split(",") if c.strip()]
 
+# (2) liste scannée
+naf_select_ms = [canon_naf(c) for c in st.session_state["naf_options"] if c]
+
+# (3) divisions/secteurs
+naf_from_div = [canon_naf(c) for (c, _) in (sect_options_unique if take_all else secteurs_sel)]
+
+# union finale
 naf_final = sorted(set(naf_typed) | set(naf_select_ms) | set(naf_from_div))
+
 st.caption(f"🧩 Codes NAF retenus ({len(naf_final)}): {', '.join(naf_final) if naf_final else '—'}")
 
 # 2bis) Options de filtrage
