@@ -366,33 +366,46 @@ def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> 
 
 def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege: bool) -> pd.DataFrame:
     fb = files_by_dep()
-    naf_set = {re.sub(r"[^0-9A-Z.]", "", c.upper()) for c in naf_selected if c}
-    frames = []
 
+    # 1) Ensemble canonique (sans points) pour le filtrage Pandas
+    naf_set_canon = {canon_naf(c) for c in naf_selected if c}
+
+    # 2) Ensemble "candidats" pour le pushdown Parquet : on inclut les deux formes
+    naf_candidates = set()
+    for c in naf_set_canon:
+        if not c:
+            continue
+        naf_candidates.add(c)  # ex: 0111Z
+        if len(c) >= 5:
+            naf_candidates.add(f"{c[:2]}.{c[2:4]}{c[4:]}")  # ex: 01.11Z
+
+    frames = []
     needed = [c for c in NEEDED_COLS if c]
     for dep in selected_deps:
         files = fb.get(dep, [])
         if not files:
             continue
 
-        # 1) Parquet
+        # ----- Parquet
         pq_files = [str(p) for p in files if p.suffix.lower() == ".parquet"]
         if pq_files:
-            filt = pc.field(COLS["naf"]).isin(list(naf_set)) if naf_set else None
             dset = ds.dataset(pq_files, format="parquet")
             cols = [c for c in needed if c in dset.schema.names]
+            # pushdown seulement si on a des candidats
+            filt = pc.field(COLS["naf"]).isin(list(naf_candidates)) if naf_candidates else None
             try:
                 tbl = dset.to_table(columns=cols, filter=filt)
                 df = tbl.to_pandas()
                 df["__dep__"] = dep
                 df["__source__"] = "parquet"
-                df = _filter_in_pandas(df, naf_set=set(), only_siege=only_siege)
+                # 👉 filtrage final en Pandas sur les formes CANONIQUES
+                df = _filter_in_pandas(df, naf_set=naf_set_canon, only_siege=only_siege)
                 if not df.empty:
                     frames.append(df)
             except Exception:
                 pass
 
-        # 2) CSV-like
+        # ----- CSV-like
         csv_files = [p for p in files if p.suffix.lower() in (".csv", ".gz", ".zip") or p.name.lower().endswith(".csv.gz")]
         for f in csv_files:
             name = f.name.lower()
@@ -413,7 +426,8 @@ def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege:
                         for ch in pd.read_csv(f, **kw):
                             ch["__dep__"] = dep
                             ch["__source__"] = f.name
-                            ch = _filter_in_pandas(ch, naf_set=naf_set, only_siege=only_siege)
+                            # 👉 filtrage final en Pandas sur CANONIQUE
+                            ch = _filter_in_pandas(ch, naf_set=naf_set_canon, only_siege=only_siege)
                             if not ch.empty:
                                 frames.append(ch)
                         ok = True
@@ -691,7 +705,11 @@ if st.session_state.get("go", False):
 
     with st.spinner("Chargement filtré (entreprises)…"):
         df = load_filtered(selected_deps, naf_final, only_siege)
-
+        
+    with st.expander("🔎 Debug NAF"):
+        st.write("Échantillon NAF brut :", df[COLS["naf"]].astype(str).head(10).tolist())
+        st.write("NAF sélectionnés (canon) :", sorted(list({canon_naf(x) for x in naf_final})))
+    
     if df.empty:
         st.info("Aucune ligne avec ces filtres (NAF, siège, coordonnées) dans les départements sélectionnés.")
         st.stop()
