@@ -732,12 +732,12 @@ if st.session_state.get("go", False):
 
     ent = ent.merge(ul, on="siren", how="left")
 
+# ✅ À GARDER (une seule fois)
 ent["nom_affiche"] = (
     ent["nom_ul"].fillna("")
     .replace(r"^\s*$", pd.NA, regex=True)
     .fillna(ent["nom_etab"])
-)
-ent["nom_affiche"] = ent["nom_affiche"].fillna("Nom non diffusible")
+).fillna("Nom non diffusible")
 
 # Diagnostic utile
 ul_vide = ent["nom_ul"].isna() | (ent["nom_ul"].astype(str).str.strip() == "")
@@ -752,11 +752,6 @@ st.caption(
     f"UL purgées: {int((ul_vide & ul_purg).sum()):,} | "
     f"taux de match UL: {1 - (ul_vide.sum()/max(len(ent),1)):.1%}"
 )
-
-    # Nom final : priorité UL, repli sur établissement
-    ent["nom_affiche"] = ent["nom_ul"]
-    mask_vide = ent["nom_affiche"].isna() | (ent["nom_affiche"].astype(str).str.strip()=="")
-    ent.loc[mask_vide, "nom_affiche"] = ent.loc[mask_vide, "nom_etab"]
 
     # Liens (Google Maps + PagesJaunes) — version fiche + secours
     ent["gmaps_fiche"] = ent.apply(lambda r: build_gmaps_fiche(r["nom_affiche"], r["adresse"], r["cp"], r["commune"], r["siret"]), axis=1)
