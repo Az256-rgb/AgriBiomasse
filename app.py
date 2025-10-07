@@ -208,7 +208,7 @@ NAF_DIVISIONS = {
 def canon_naf(x) -> str:
     if not isinstance(x, str):
         x = "" if x is None else str(x)
-    return re.sub(r"[^0-9A-Z]", "", x.upper())  # retire les points etc.
+    return re.sub(r"[^0-9A-Z]", "", x.upper())  # enlève les points, espaces, etc.
 
 def _norm(s: str):
     if not isinstance(s, str): return ""
@@ -311,14 +311,8 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
                     dset = ds.dataset([str(f)], format="parquet")
                     t = dset.to_table(columns=[COLS["naf"]])
                     s = pd.Series(t[COLS["naf"]].to_pandas())
-                    naf.update(
-                        s.astype("string").map(canon_naf).dropna().unique()
-                    )
-
-                    ###s = pd.Series(t[COLS["naf"]].to_pandas(dtype="string", types_mapper=pd.ArrowDtype))
-                    ###naf.update(
-                        ###s.astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True).dropna().unique()
-                    ###)
+                    naf.update(s.astype("string").map(canon_naf).dropna().unique())
+                
                 elif name.endswith(".csv.gz") or name.endswith(".gz") or name.endswith(".csv") or name.endswith(".zip"):
                     seps = [None, ";", ",", "\t"]; encs = ["utf-8", "latin1"]
                     read_ok = False
@@ -337,12 +331,8 @@ def discover_naf_codes(selected_deps: tuple[str, ...]) -> list[str]:
                                 it = pd.read_csv(f, chunksize=150_000, **kw)
                                 cnt = 0
                                 for ch in it:
-                                    ###s = ch[COLS["naf"]].astype("string").str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
-                                    ###naf.update(s.dropna().unique())
                                     s = ch[COLS["naf"]].astype("string").map(canon_naf)
-                                    naf.update(
-                                        s.dropna().unique()
-                                    )
+                                    naf.update(s.dropna().unique())
                                     cnt += len(ch)
                                     if cnt >= 600_000:
                                         break
@@ -364,8 +354,6 @@ def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> 
     if COLS["etat"] in df.columns:
         df = df[df[COLS["etat"]].astype(str).str.upper().str.startswith("A")]
     if naf_set and COLS["naf"] in df.columns:
-        ###naf_clean = df[COLS["naf"]].astype(str).str.upper().str.replace(r"[^0-9A-Z.]", "", regex=True)
-        ###df = df[naf_clean.isin(list(naf_set))]
         naf_clean = df[COLS["naf"]].astype(str).map(canon_naf)
         df = df[naf_clean.isin(list(naf_set))]
     if only_siege and COLS["siege"] in df.columns:
@@ -467,40 +455,45 @@ def _best_ul_name(row: pd.Series) -> str:
 @st.cache_data(show_spinner=False)
 def load_ul_names_for(sirens: list[str]) -> pd.DataFrame:
     """
-    Récupère nom UL par SIREN avec détection de type:
-    - Si 'siren' UL est un entier → on filtre en INT (leading zeros disparaissent côté UL).
-    - Si 'siren' UL est une string → on filtre en string + on tolère les variantes sans leading zero.
-    On renvoie: ['siren','nom_ul','statutDiffusionUniteLegale','unitePurgeeUniteLegale'] (siren zfill(9)).
+    Retourne ['siren','nom_ul','statutDiffusionUniteLegale','unitePurgeeUniteLegale'].
+    - Cherche d'abord data/unite_legale/ul_parts/*.parquet
+    - Sinon, prend n'importe quel *.parquet dans data/unite_legale/
+    - Détecte la colonne siren (casse/tpe), gère int vs string.
     """
-    if not sirens or not DIR_UL.exists():
+    base_dir = ROOT / "data" / "unite_legale"
+
+    if not sirens or not base_dir.exists():
         return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
-    parts = [str(p) for p in sorted(DIR_UL.glob("*.parquet"))]
+    parts = sorted((base_dir / "ul_parts").glob("*.parquet"))
+    if not parts:
+        parts = sorted(base_dir.glob("*.parquet"))
+
     if not parts:
         return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
-    dset = ds.dataset(parts, format="parquet")
-    schema = dset.schema
-    if "siren" not in schema.names:
-        # sécurité : rien à faire si la colonne n'existe pas
+    dset = ds.dataset([str(p) for p in parts], format="parquet")
+
+    # trouve la colonne siren quel que soit le nom exact / casse
+    siren_col = next((c for c in dset.schema.names if c.lower() == "siren"), None)
+    if not siren_col:
         return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
-    t = schema.field("siren").type
+    t = dset.schema.field(siren_col).type
     UL_cols_wanted = [
         "denominationUniteLegale","denominationUsuelle1UniteLegale","denominationUsuelle2UniteLegale",
         "denominationUsuelle3UniteLegale","sigleUniteLegale","nomUsageUniteLegale","nomUniteLegale",
         "prenom1UniteLegale","prenomUsuelUniteLegale","pseudonymeUniteLegale",
         "statutDiffusionUniteLegale","unitePurgeeUniteLegale"
     ]
-    cols = ["siren"] + [c for c in UL_cols_wanted if c in schema.names]
+    cols = [siren_col] + [c for c in UL_cols_wanted if c in dset.schema.names]
 
-    # Sirens normalisés côté app
-    sirens = [re.sub(r"\D", "", s or "")[:9] for s in sirens]
-    sirens = [s.zfill(9) for s in sirens if s]
+    # normalise sirens demandés
+    sirens = [re.sub(r"\D", "", s or "")[:9].zfill(9) for s in sirens if s]
 
     CHUNK = 60_000
     out = []
-    # utilitaires nom
+
     def best_name(df):
         nom = (
             df.get("denominationUniteLegale").fillna("")
@@ -519,31 +512,25 @@ def load_ul_names_for(sirens: list[str]) -> pd.DataFrame:
     for i in range(0, len(sirens), CHUNK):
         chunk = sirens[i:i+CHUNK]
 
-        # filtre selon type UL
         if pa.types.is_integer(t):
-            # UL.siren = INT → convertir chunk en entiers (perte de zéros assumée pour matcher)
             ints = []
             for s in chunk:
-                try:
-                    ints.append(int(s))  # "012345678" -> 12345678
-                except Exception:
-                    pass
-            if not ints:
-                continue
-            f = ds.field("siren").isin(pa.array(ints, type=t))
+                try: ints.append(int(s))
+                except: pass
+            if not ints: continue
+            f = ds.field(siren_col).isin(pa.array(ints, type=t))
         else:
-            # UL.siren = STRING → tolère les deux formes (zfilled et sans leading zeros)
             variants = list({*chunk, *[s.lstrip("0") or "0" for s in chunk]})
-            f = ds.field("siren").cast(pa.string()).isin(pa.array(variants, type=pa.string()))
+            f = ds.field(siren_col).cast(pa.string()).isin(pa.array(variants, type=pa.string()))
 
         tbl = dset.to_table(columns=cols, filter=f)
         if tbl.num_rows == 0:
             continue
         df = tbl.to_pandas()
 
-        # Harmonise 'siren' UL en 9 chiffres (string) pour la merge
+        # harmonise 'siren' → string 9
         df["siren"] = (
-            df["siren"].astype("string")
+            df[siren_col].astype("string")
               .str.replace(r"\D", "", regex=True)
               .str.zfill(9).str[:9]
         )
@@ -553,8 +540,7 @@ def load_ul_names_for(sirens: list[str]) -> pd.DataFrame:
     if not out:
         return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
-    res = pd.concat(out, ignore_index=True).drop_duplicates("siren", keep="first")
-    return res
+    return pd.concat(out, ignore_index=True).drop_duplicates("siren", keep="first")
 
 # ==================== METHANISEURS ====================
 def _find_meth_file() -> Path | None:
@@ -677,18 +663,10 @@ if divisions_sel and sect_options_unique:
 naf_from_div = [c for (c, _) in sect_options_unique] if take_all else [c for (c, _) in secteurs_sel]
 
 # --- Fusion des 3 sources : saisie libre + scan + divisions/secteurs ---
-# (1) saisie libre
 naf_typed = [canon_naf(c) for c in naf_input.split(",") if c.strip()]
-
-# (2) liste scannée
 naf_select_ms = [canon_naf(c) for c in st.session_state["naf_options"] if c]
-
-# (3) divisions/secteurs
 naf_from_div = [canon_naf(c) for (c, _) in (sect_options_unique if take_all else secteurs_sel)]
-
-# union finale
 naf_final = sorted(set(naf_typed) | set(naf_select_ms) | set(naf_from_div))
-
 st.caption(f"🧩 Codes NAF retenus ({len(naf_final)}): {', '.join(naf_final) if naf_final else '—'}")
 
 # 2bis) Options de filtrage
@@ -746,7 +724,6 @@ if st.session_state.get("go", False):
     # Contrôles avant jointure
     rows_before        = len(ent)
     siret_uniq_before  = ent["siret"].nunique()
-    ent["siren"]       = ent["siret"].str.slice(0, 9)
     siren_uniq_before  = ent["siren"].nunique()
 
     # === Jointure UL ===
