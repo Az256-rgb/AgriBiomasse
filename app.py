@@ -367,58 +367,50 @@ def _filter_in_pandas(df: pd.DataFrame, naf_set: set[str], only_siege: bool) -> 
 def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege: bool) -> pd.DataFrame:
     fb = files_by_dep()
 
-    # 1) Ensemble canonique (sans points) pour le filtrage Pandas
-    naf_set_canon = {canon_naf(c) for c in naf_selected if c}
-
-    # 2) Ensemble "candidats" pour le pushdown Parquet : on inclut les deux formes
-    naf_candidates = set()
-    for c in naf_set_canon:
-        if not c:
-            continue
-        naf_candidates.add(c)  # ex: 0111Z
-        if len(c) >= 5:
-            naf_candidates.add(f"{c[:2]}.{c[2:4]}{c[4:]}")  # ex: 01.11Z
-
+    # --- IMPORTANT : naf_set est bien défini ici, en canonique ---
+    naf_set = {canon_naf(c) for c in naf_selected if c}
     frames = []
+
     needed = [c for c in NEEDED_COLS if c]
     for dep in selected_deps:
         files = fb.get(dep, [])
         if not files:
             continue
 
-    # 1) Parquet
-    pq_files = [str(p) for p in files if p.suffix.lower() == ".parquet"]
-    if pq_files:
-        dset = ds.dataset(pq_files, format="parquet")
-        cols = [c for c in needed if c in dset.schema.names]
-    
-        # --- filtre NAF canonique côté Arrow ---
-        if naf_set:
-            fld = pc.field(COLS["naf"]).cast(pa.string())
-            # upper + suppression de tout sauf [0-9A-Z] pour obtenir 1051C à partir de '10.51C'
-            naf_clean = pc.replace_substring_regex(
-                pc.utf8_upper(fld),
-                pattern=r"[^0-9A-Z]",
-                replacement=""
-            )
-            filt = pc.is_in(naf_clean, value_set=pa.array(list(naf_set), type=pa.string()))
-        else:
+        # 1) Parquet
+        pq_files = [str(p) for p in files if p.suffix.lower() == ".parquet"]
+        if pq_files:
+            dset = ds.dataset(pq_files, format="parquet")
+            cols = [c for c in needed if c in dset.schema.names]
+
+            # --- Filtre NAF côté Arrow : on normalise la colonne NAF (upper + enlève tout sauf [0-9A-Z]) ---
             filt = None
-    
-        try:
-            tbl = dset.to_table(columns=cols, filter=filt)
-            df = tbl.to_pandas()
-            df["__dep__"] = dep
-            df["__source__"] = "parquet"
-            # on garde le filtrage pandas (siege, coords) mais PAS le naf (déjà fait)
-            df = _filter_in_pandas(df, naf_set=set(), only_siege=only_siege)
-            if not df.empty:
-                frames.append(df)
-        except Exception:
-            pass
+            if naf_set:
+                try:
+                    naf_field = pc.field(COLS["naf"]).cast(pa.string())
+                    naf_upper = pc.utf8_upper(naf_field)
+                    naf_norm  = pc.replace_substring_regex(naf_upper, pattern=r"[^0-9A-Z]", replacement="")
+                    filt = pc.is_in(naf_norm, value_set=pa.array(sorted(naf_set), type=pa.string()))
+                except Exception:
+                    # Si la version de PyArrow ne supporte pas replace_substring_regex → on lira sans filtre
+                    # et on filtrera ensuite en Pandas (plus lent mais robuste).
+                    filt = None
 
+            try:
+                tbl = dset.to_table(columns=cols, filter=filt)
+                df = tbl.to_pandas()
+                df["__dep__"] = dep
+                df["__source__"] = "parquet"
 
-        # ----- CSV-like
+                # Si on a filtré NAF côté Arrow, on remet naf_set vide ici.
+                # Sinon (filt None), on filtre en Pandas avec naf_set.
+                df = _filter_in_pandas(df, naf_set=set() if filt is not None else naf_set, only_siege=only_siege)
+                if not df.empty:
+                    frames.append(df)
+            except Exception:
+                pass
+
+        # 2) CSV-like
         csv_files = [p for p in files if p.suffix.lower() in (".csv", ".gz", ".zip") or p.name.lower().endswith(".csv.gz")]
         for f in csv_files:
             name = f.name.lower()
@@ -439,8 +431,8 @@ def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege:
                         for ch in pd.read_csv(f, **kw):
                             ch["__dep__"] = dep
                             ch["__source__"] = f.name
-                            # 👉 filtrage final en Pandas sur CANONIQUE
-                            ch = _filter_in_pandas(ch, naf_set=naf_set_canon, only_siege=only_siege)
+                            # Pour CSV on laisse le filtre Pandas gérer NAF (canon_naf)
+                            ch = _filter_in_pandas(ch, naf_set=naf_set, only_siege=only_siege)
                             if not ch.empty:
                                 frames.append(ch)
                         ok = True
