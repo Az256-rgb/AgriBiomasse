@@ -21,6 +21,8 @@ ROOT     = Path(__file__).parent
 DIR_ENT  = ROOT / "data" / "entreprises"
 DIR_METH = ROOT / "data" / "methaniseurs"
 DIR_UL   = ROOT / "data" / "nomenclatures" / "ul_parts"   # <-- UL partitions
+UL_SEARCH_DIRS = [ROOT / "data" / "nomenclatures"]  # là où sont tes ul_part_*.parquet
+
 
 # Colonnes SIRENE (selon tes fichiers entreprises)
 COLS = {
@@ -209,6 +211,17 @@ def canon_naf(x) -> str:
     if not isinstance(x, str):
         x = "" if x is None else str(x)
     return re.sub(r"[^0-9A-Z]", "", x.upper())  # enlève les points, espaces, etc.
+
+def _ul_signature() -> str:
+    sig = []
+    for d in UL_SEARCH_DIRS:
+        if d.exists():
+            for p in sorted(d.glob("*.parquet")):
+                try:
+                    sig.append(f"{p.name}:{p.stat().st_mtime_ns}")
+                except Exception:
+                    sig.append(p.name)
+    return "|".join(sig) or "no-ul-files"
 
 def _norm(s: str):
     if not isinstance(s, str): return ""
@@ -472,46 +485,83 @@ def _best_ul_name(row: pd.Series) -> str:
     return (v or "").strip()
 
 @st.cache_data(show_spinner=False)
-def load_ul_names_for(sirens: list[str]) -> pd.DataFrame:
-    """
-    Retourne ['siren','nom_ul','statutDiffusionUniteLegale','unitePurgeeUniteLegale'].
-    - Cherche d'abord data/unite_legale/ul_parts/*.parquet
-    - Sinon, prend n'importe quel *.parquet dans data/unite_legale/
-    - Détecte la colonne siren (casse/tpe), gère int vs string.
-    """
-    base_dir = ROOT / "data" / "unite_legale"
-
-    if not sirens or not base_dir.exists():
+def load_ul_names_for(sirens: list[str], ul_sig: str) -> pd.DataFrame:
+    # ul_sig ne sert qu'à invalider le cache si les fichiers changent
+    sirens = [re.sub(r"\D", "", (s or ""))[:9].zfill(9) for s in sirens if s]
+    if not sirens:
         return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
-    parts = sorted((base_dir / "ul_parts").glob("*.parquet"))
-    if not parts:
-        parts = sorted(base_dir.glob("*.parquet"))
-
+    parts = []
+    for d in UL_SEARCH_DIRS:
+        if d.exists():
+            parts += sorted(d.glob("*.parquet"))
     if not parts:
         return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
     dset = ds.dataset([str(p) for p in parts], format="parquet")
 
-    # trouve la colonne siren quel que soit le nom exact / casse
+    # colonne SIREN (peu importe la casse)
     siren_col = next((c for c in dset.schema.names if c.lower() == "siren"), None)
     if not siren_col:
         return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
 
     t = dset.schema.field(siren_col).type
-    UL_cols_wanted = [
+    wanted = [
         "denominationUniteLegale","denominationUsuelle1UniteLegale","denominationUsuelle2UniteLegale",
         "denominationUsuelle3UniteLegale","sigleUniteLegale","nomUsageUniteLegale","nomUniteLegale",
         "prenom1UniteLegale","prenomUsuelUniteLegale","pseudonymeUniteLegale",
-        "statutDiffusionUniteLegale","unitePurgeeUniteLegale"
+        "statutDiffusionUniteLegale","unitePurgeeUniteLegale",
     ]
-    cols = [siren_col] + [c for c in UL_cols_wanted if c in dset.schema.names]
+    cols = [siren_col] + [c for c in wanted if c in dset.schema.names]
 
-    # normalise sirens demandés
-    sirens = [re.sub(r"\D", "", s or "")[:9].zfill(9) for s in sirens if s]
+    # filtre robuste int/string avec ou sans zéros
+    if pa.types.is_integer(t):
+        vals = []
+        for s in sirens:
+            try: vals.append(int(s.lstrip("0") or "0"))
+            except: pass
+        if not vals:
+            return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
+        filt = ds.field(siren_col).isin(vals)
+    else:
+        variants = list({*sirens, *[s.lstrip("0") or "0" for s in sirens]})
+        filt = ds.field(siren_col).cast(pa.string()).isin(variants)
 
-    CHUNK = 60_000
-    out = []
+    tbl = dset.to_table(columns=cols, filter=filt)
+    if tbl.num_rows == 0:
+        return pd.DataFrame(columns=["siren","nom_ul","statutDiffusionUniteLegale","unitePurgeeUniteLegale"])
+    df = tbl.to_pandas()
+
+    df["siren"] = (
+        df[siren_col].astype("string")
+        .str.replace(r"\D", "", regex=True)
+        .str.zfill(9).str[:9]
+    )
+
+    def _best_name(frame: pd.DataFrame) -> pd.Series:
+        nom = (
+            frame.get("denominationUniteLegale").fillna("")
+            .replace(r"^\s*$", pd.NA, regex=True)
+            .fillna(frame.get("denominationUsuelle1UniteLegale"))
+            .fillna(frame.get("denominationUsuelle2UniteLegale"))
+            .fillna(frame.get("denominationUsuelle3UniteLegale"))
+            .fillna(frame.get("sigleUniteLegale"))
+        )
+        prenom = frame.get("prenom1UniteLegale", "").fillna("")
+        nompp  = frame.get("nomUsageUniteLegale", frame.get("nomUniteLegale", "")).fillna("")
+        nom = nom.fillna((prenom + " " + nompp).str.strip()).replace("", pd.NA)
+        nom = nom.fillna(frame.get("pseudonymeUniteLegale"))
+        return nom
+
+    df["nom_ul"] = _best_name(df)
+
+    out = df[["siren","nom_ul"]].copy()
+    if "statutDiffusionUniteLegale" in df.columns:
+        out["statutDiffusionUniteLegale"] = df["statutDiffusionUniteLegale"]
+    if "unitePurgeeUniteLegale" in df.columns:
+        out["unitePurgeeUniteLegale"] = df["unitePurgeeUniteLegale"]
+    return out.drop_duplicates("siren", keep="first")
+
 
     def best_name(df):
         nom = (
@@ -751,8 +801,9 @@ if st.session_state.get("go", False):
 
     # === Jointure UL ===
     with st.spinner("Jointure des noms d’Unité Légale…"):
+        ul_sig = _ul_signature()
         sirens_need = sorted(ent["siren"].dropna().unique().tolist())
-        ul = load_ul_names_for(sirens_need)  # ['siren','nom_ul'] unique
+        ul = load_ul_names_for(sirens_need, ul_sig)
 
     ent = ent.merge(ul, on="siren", how="left")
 
