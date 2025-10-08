@@ -386,24 +386,37 @@ def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege:
         if not files:
             continue
 
-        # ----- Parquet
-        pq_files = [str(p) for p in files if p.suffix.lower() == ".parquet"]
-        if pq_files:
-            dset = ds.dataset(pq_files, format="parquet")
-            cols = [c for c in needed if c in dset.schema.names]
-            # pushdown seulement si on a des candidats
-            filt = pc.field(COLS["naf"]).isin(list(naf_candidates)) if naf_candidates else None
-            try:
-                tbl = dset.to_table(columns=cols, filter=filt)
-                df = tbl.to_pandas()
-                df["__dep__"] = dep
-                df["__source__"] = "parquet"
-                # 👉 filtrage final en Pandas sur les formes CANONIQUES
-                df = _filter_in_pandas(df, naf_set=naf_set_canon, only_siege=only_siege)
-                if not df.empty:
-                    frames.append(df)
-            except Exception:
-                pass
+    # 1) Parquet
+    pq_files = [str(p) for p in files if p.suffix.lower() == ".parquet"]
+    if pq_files:
+        dset = ds.dataset(pq_files, format="parquet")
+        cols = [c for c in needed if c in dset.schema.names]
+    
+        # --- filtre NAF canonique côté Arrow ---
+        if naf_set:
+            fld = pc.field(COLS["naf"]).cast(pa.string())
+            # upper + suppression de tout sauf [0-9A-Z] pour obtenir 1051C à partir de '10.51C'
+            naf_clean = pc.replace_substring_regex(
+                pc.utf8_upper(fld),
+                pattern=r"[^0-9A-Z]",
+                replacement=""
+            )
+            filt = pc.is_in(naf_clean, value_set=pa.array(list(naf_set), type=pa.string()))
+        else:
+            filt = None
+    
+        try:
+            tbl = dset.to_table(columns=cols, filter=filt)
+            df = tbl.to_pandas()
+            df["__dep__"] = dep
+            df["__source__"] = "parquet"
+            # on garde le filtrage pandas (siege, coords) mais PAS le naf (déjà fait)
+            df = _filter_in_pandas(df, naf_set=set(), only_siege=only_siege)
+            if not df.empty:
+                frames.append(df)
+        except Exception:
+            pass
+
 
         # ----- CSV-like
         csv_files = [p for p in files if p.suffix.lower() in (".csv", ".gz", ".zip") or p.name.lower().endswith(".csv.gz")]
