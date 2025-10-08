@@ -20,7 +20,7 @@ st.title("🗺️ Carte entreprises par NAF — sélection par département + co
 ROOT     = Path(__file__).parent
 DIR_ENT  = ROOT / "data" / "entreprises"
 DIR_METH = ROOT / "data" / "methaniseurs"
-DIR_UL   = ROOT / "data" / "unite_legale" / "ul_parts"   # <-- UL partitions
+DIR_UL   = ROOT / "data" / "nomenclatures" / "ul_parts"   # <-- UL partitions
 
 # Colonnes SIRENE (selon tes fichiers entreprises)
 COLS = {
