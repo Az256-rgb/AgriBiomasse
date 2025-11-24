@@ -670,42 +670,122 @@ def load_ul_names_for(sirens: list[str], ul_sig: str) -> pd.DataFrame:
     return pd.concat(out, ignore_index=True).drop_duplicates("siren", keep="first")
 
 # ==================== METHANISEURS ====================
-def _find_meth_file() -> Path | None:
-    for p in [DIR_METH / "methaniseurs.parquet", DIR_METH / "methaniseurs.csv.gz", DIR_METH / "methaniseurs.csv"]:
-        if p.exists(): return p
-    for ext in (".parquet", ".csv.gz", ".csv"):
-        found = list(DIR_METH.glob(f"*{ext}"))
-        if found: return found[0]
+# ==================== METH EXCEL (Injection / Cogénération) ====================
+def _find_meth_excel() -> Path | None:
+    for name in ("methaniseurs.xlsx", "methaniseurs.xls"):
+        p = DIR_METH / name
+        if p.exists():
+            return p
     return None
 
-@st.cache_data(show_spinner=False)
-def load_methaniseurs():
-    p = _find_meth_file()
-    if not p: return None
-    n = p.name.lower()
-    if n.endswith(".parquet"):
-        dfm = pd.read_parquet(p)
-    elif n.endswith(".csv.gz") or n.endswith(".gz"):
-        dfm = pd.read_csv(p, compression="gzip")
-    else:
-        dfm = pd.read_csv(p)
-    def pick(cols, cands):
-        for c in cands:
-            if c in cols: return c
+def _find_communes_centroids() -> Path | None:
+    candidates = [
+        ROOT / "data" / "geo" / "communes_centroids.parquet",
+        ROOT / "data" / "geo" / "communes_centroids.csv",
+        DIR_METH / "communes_centroids.parquet",
+        DIR_METH / "communes_centroids.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+@st.cache_data(show_spinner=True)
+def _load_centroids():
+    p = _find_communes_centroids()
+    if not p:
         return None
-    c_lat = pick(dfm.columns, ["latitude","lat","y"])
-    c_lon = pick(dfm.columns, ["longitude","lon","x"])
-    c_nom = pick(dfm.columns, ["nom","name","denomination","enseigne"])
-    c_addr= pick(dfm.columns, ["adresse","address","geo_adresse"])
-    if not c_lat or not c_lon: return None
-    dfm["lat"] = pd.to_numeric(dfm[c_lat].astype(str).str.replace(",", ".", regex=False), errors="coerce")
-    dfm["lon"] = pd.to_numeric(dfm[c_lon].astype(str).str.replace(",", ".", regex=False), errors="coerce")
-    dfm = dfm[dfm["lat"].notna() & dfm["lon"].notna()].copy()
-    if c_nom and "nom" not in dfm.columns: dfm.rename(columns={c_nom:"nom"}, inplace=True)
-    if c_addr and "adresse" not in dfm.columns: dfm.rename(columns={c_addr:"adresse"}, inplace=True)
-    dfm["gmaps_url"] = dfm.apply(lambda r: build_gmaps_point(r.get("lat"), r.get("lon"), r.get("nom")), axis=1)
-    keep = [c for c in ["nom","adresse","lat","lon","gmaps_url"] if c in dfm.columns]
-    return dfm[keep].copy()
+    if p.suffix.lower() == ".parquet":
+        df = pd.read_parquet(p)
+    else:
+        df = pd.read_csv(p)
+    # canon
+    df = df.rename(columns={c: c.lower() for c in df.columns})
+    # attend 'insee','lat','lon'
+    if not {"insee","lat","lon"}.issubset(set(df.columns)):
+        return None
+    df["insee"] = df["insee"].astype(str).str.zfill(5).str[:5]
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    return df[["insee","lat","lon"]].dropna()
+
+def _dep_from_insee(insee: str) -> str:
+    # départements DOM 97*/98* sur 3 chiffres, sinon 2
+    if not isinstance(insee, str):
+        insee = str(insee or "")
+    insee = re.sub(r"\D", "", insee)[:5]
+    if insee.startswith(("97","98")):
+        return insee[:3]
+    return insee[:2]
+
+@st.cache_data(show_spinner=True)
+def load_meth_from_excel(selected_deps: list[str], uploaded_bytes: bytes | None):
+    """
+    Lit l'Excel (ou un upload Streamlit) avec onglets 'Injection' et 'Cogeneration',
+    renvoie deux DataFrames (inj, cog) avec lat/lon si centroids dispo.
+    """
+    # 1) source Excel
+    excel_path = _find_meth_excel()
+    if uploaded_bytes:
+        xls = pd.ExcelFile(BytesIO(uploaded_bytes))
+    elif excel_path:
+        xls = pd.ExcelFile(excel_path)
+    else:
+        return None, None, {"no_excel": True}
+
+    needed_cols = {"Nom","Commune","Type","MES","EPC","Pour en savoir +","Unité","Valeur"}
+
+    def _read_sheet(sheet_name, mode_label):
+        if sheet_name not in xls.sheet_names:
+            return pd.DataFrame()
+        df = pd.read_excel(xls, sheet_name=sheet_name)
+        # normalise
+        df.columns = [str(c).strip() for c in df.columns]
+        missing = needed_cols - set(df.columns)
+        # on tolère colonnes manquantes, on remplit vide
+        for c in missing:
+            df[c] = pd.NA
+        df["mode"] = mode_label  # "Injection" / "Cogeneration"
+        # parse Commune "59034 Lille" → insee=59034, commune_name=Lille
+        s = df["Commune"].astype(str)
+        insee = s.str.extract(r"(\d{5})")[0].fillna("")
+        name  = s.str.replace(r"^\s*\d{5}\s*", "", regex=True).str.strip()
+        df["insee"] = insee.str.zfill(5).str[:5]
+        df["commune_label"] = name.where(name.ne(""), s)  # fallback
+        df["dep"] = df["insee"].map(_dep_from_insee)
+        return df
+
+    df_inj = _read_sheet("Injection", "Injection")
+    df_cog = _read_sheet("Cogeneration", "Cogeneration")
+
+    # 2) filtre départements
+    if selected_deps:
+        df_inj = df_inj[df_inj["dep"].isin(selected_deps)].copy()
+        df_cog = df_cog[df_cog["dep"].isin(selected_deps)].copy()
+
+    # 3) géocodage via centroids
+    cent = _load_centroids()
+    stats = {"no_excel": False, "centroids_missing": cent is None}
+    if cent is not None:
+        for df_ in (df_inj, df_cog):
+            if df_.empty:
+                continue
+            df_.merge(cent, on="insee", how="left", copy=False)
+            df_["lat"] = pd.to_numeric(df_.get("lat"), errors="coerce")
+            df_["lon"] = pd.to_numeric(df_.get("lon"), errors="coerce")
+            df_.rename(columns={"Nom":"nom"}, inplace=True)
+            df_["gmaps_url"] = df_.apply(lambda r: build_gmaps_point(r.get("lat"), r.get("lon"), r.get("nom")), axis=1)
+        # nettoyer colonnes finales
+        keep = ["nom","commune_label","insee","dep","MES","EPC","Pour en savoir +","Type","Unité","Valeur","mode","lat","lon","gmaps_url"]
+        df_inj = df_inj[keep].dropna(subset=["lat","lon"])
+        df_cog = df_cog[keep].dropna(subset=["lat","lon"])
+    else:
+        # pas de centroids -> on remonte stats et on ne met pas lat/lon
+        df_inj = pd.DataFrame(columns=["nom","commune_label","insee","dep","lat","lon","mode","MES","EPC","Pour en savoir +","Type","Unité","Valeur"])
+        df_cog = pd.DataFrame(columns=df_inj.columns)
+
+    return df_inj, df_cog, stats
+
 
 # ==================== UI ====================
 # --- état UI par défaut (évite les KeyError au 1er run) ---
@@ -913,15 +993,24 @@ if st.session_state.get("go", False):
         })
 
     # ---------- Couche Méthaniseurs ----------
+    # ---------- Couche Méthaniseurs ----------
     st.subheader("4) Couche optionnelle : Méthaniseurs")
-    meth_file = _find_meth_file()
-    show_meth = st.checkbox(
-        "Afficher la couche 'Méthaniseurs' (si un fichier est présent dans data/methaniseurs/)",
-        value=bool(meth_file)
-    )
-    meth = load_methaniseurs() if show_meth else None
-    if show_meth and meth is None:
-        st.info("Aucun fichier valide trouvé pour les méthaniseurs (attendu: nom, adresse, lat, lon).")
+    with st.expander("Source Méthaniseurs (Excel 'Injection' / 'Cogeneration')"):
+        upl = st.file_uploader("Dépose ici le fichier Excel des méthaniseurs (sinon l'app cherchera data/methaniseurs/methaniseurs.xlsx)", type=["xlsx","xls"])
+        want_meth = st.checkbox("Afficher la couche 'Méthaniseurs' (Injection + Cogénération)", value=True)
+    
+    meth_inj = meth_cog = None
+    meth_stats = {"no_excel": False, "centroids_missing": False}
+    if want_meth:
+        inj, cog, stats = load_meth_from_excel(selected_deps, uploaded_bytes=upl.getvalue() if upl else None)
+        meth_inj, meth_cog, meth_stats = inj, cog, stats
+        if stats.get("no_excel"):
+            st.info("Aucun fichier Excel trouvé (uploader ci-dessus ou place 'data/methaniseurs/methaniseurs.xlsx').")
+        if stats.get("centroids_missing"):
+            st.warning("Pas de centroids de communes trouvés (ajoute 'communes_centroids.parquet|csv' avec colonnes insee,lat,lon).")
+        if meth_inj is not None and meth_cog is not None:
+            st.caption(f"Injection: {0 if meth_inj is None else len(meth_inj):,} | Cogénération: {0 if meth_cog is None else len(meth_cog):,}")
+
 
     # ---------- Carte ----------
     st.subheader("5) Carte")
@@ -944,19 +1033,42 @@ if st.session_state.get("go", False):
                           icon=folium.Icon(color="blue", icon="briefcase", prefix="fa")).add_to(cluster_ent)
         except Exception:
             continue
+    
+    # Couches Méthaniseurs depuis Excel (si dispo)
+    if want_meth and meth_inj is not None and meth_cog is not None:
+        if len(meth_inj):
+            cluster_inj = MarkerCluster(name="Méthaniseurs — Injection").add_to(m)
+            for _, r in meth_inj.iterrows():
+                try:
+                    lat, lon = float(r["lat"]), float(r["lon"])
+                except Exception:
+                    continue
+                pop = f"""<b>{_norm(str(r.get('nom','(Injection)')))}</b><br>
+                {r.get('commune_label','') or ''} ({r.get('insee','')})<br>
+                Type: {r.get('Type','') or ''} | MES: {r.get('MES','') or ''}<br>
+                EPC: {r.get('EPC','') or ''} | {r.get('Unité','') or ''}: {r.get('Valeur','') or ''}<br>
+                <a href="{r.get('Pour en savoir +','')}" target="_blank">Fiche source</a> |
+                <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a>"""
+                folium.Marker([lat, lon],
+                              popup=pop,
+                              icon=folium.Icon(color="green", icon="leaf", prefix="fa")).add_to(cluster_inj)
+        if len(meth_cog):
+            cluster_cog = MarkerCluster(name="Méthaniseurs — Cogénération").add_to(m)
+            for _, r in meth_cog.iterrows():
+                try:
+                    lat, lon = float(r["lat"]), float(r["lon"])
+                except Exception:
+                    continue
+                pop = f"""<b>{_norm(str(r.get('nom','(Cogénération)')))}</b><br>
+                {r.get('commune_label','') or ''} ({r.get('insee','')})<br>
+                Type: {r.get('Type','') or ''} | MES: {r.get('MES','') or ''}<br>
+                EPC: {r.get('EPC','') or ''} | {r.get('Unité','') or ''}: {r.get('Valeur','') or ''}<br>
+                <a href="{r.get('Pour en savoir +','')}" target="_blank">Fiche source</a> |
+                <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a>"""
+                folium.Marker([lat, lon],
+                              popup=pop,
+                              icon=folium.Icon(color="orange", icon="bolt", prefix="fa")).add_to(cluster_cog)
 
-    if meth is not None and len(meth):
-        cluster_m = MarkerCluster(name="Méthaniseurs").add_to(m)
-        for _, r in meth.iterrows():
-            popup = f"""<b>{_norm(str(r.get('nom','Méthaniseur')))}</b><br>
-            {r.get('adresse','') or ''}<br>
-            <a href="{r.get('gmaps_url','')}" target="_blank">Google Maps</a>"""
-            try:
-                folium.Marker([float(r["lat"]), float(r["lon"])],
-                              popup=popup,
-                              icon=folium.Icon(color="green", icon="leaf", prefix="fa")).add_to(cluster_m)
-            except Exception:
-                continue
 
     folium.LayerControl(collapsed=False).add_to(m)
     st_folium(m, width=1200, height=700)
@@ -973,6 +1085,14 @@ if st.session_state.get("go", False):
     csv_bytes = ent[cols_export].to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Télécharger les entreprises (CSV)", data=csv_bytes,
                        file_name="entreprises_filtrees.csv", mime="text/csv")
+                       
+    if want_meth and meth_inj is not None and meth_cog is not None and (len(meth_inj) or len(meth_cog)):
+        st.subheader("6bis) Export CSV des méthaniseurs")
+        meth_all = pd.concat([meth_inj.assign(source="Injection"), meth_cog.assign(source="Cogeneration")], ignore_index=True)
+        cols_m = ["source","nom","commune_label","insee","dep","Type","MES","EPC","Unité","Valeur","lat","lon","gmaps_url","Pour en savoir +"]
+        csv_m = meth_all[cols_m].to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Télécharger les méthaniseurs (CSV)", data=csv_m, file_name="methaniseurs_par_dep.csv", mime="text/csv")
+
 
     # ---------- Export CARTE HTML ----------
     st.subheader("7) Exporter la carte (HTML)")
@@ -987,4 +1107,6 @@ if st.session_state.get("go", False):
 
 else:
     st.info("💡 Sélectionne d’abord 1–n départements, saisis (ou scanne) des codes NAF, puis clique *Charger la carte*.")
+
+    
 
