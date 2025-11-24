@@ -879,6 +879,21 @@ st.caption(f"🧩 Codes NAF retenus ({len(naf_final)}): {', '.join(naf_final) if
 # 2bis) Options de filtrage
 only_siege = st.checkbox("Ne garder que les sièges (etablissementSiege=1)", value=False)
 
+# --- 2ter) Cibles à surligner (SIRET/SIREN) ---
+st.subheader("2ter) Cibles à surligner")
+hl_input = st.text_area(
+    "Saisis un ou plusieurs SIRET (14 chiffres) ou SIREN (9 chiffres), séparés par virgule/espaces/retour ligne",
+    value="", height=80
+)
+# Options visuelles
+col_hl = st.columns(3)
+with col_hl[0]:
+    radius_km = st.number_input("Rayon halo (km)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
+with col_hl[1]:
+    auto_zoom = st.checkbox("Auto-zoomer sur les cibles", value=True)
+with col_hl[2]:
+    show_only_targets_first = st.checkbox("Afficher d'abord les cibles", value=True)
+
 
 st.subheader("3) Charger les données filtrées")
 col_go, col_reset = st.columns([1,1])
@@ -951,6 +966,24 @@ if st.session_state.get("go", False):
         .replace(r"^\s*$", pd.NA, regex=True)
         .fillna(ent["nom_etab"])
     ).fillna("Nom non diffusible")
+    
+# --- Normalisation des identifiants cibles ---
+import itertools
+raw_tokens = re.split(r"[\s,;]+", hl_input.strip()) if hl_input else []
+raw_tokens = [re.sub(r"\D", "", t) for t in raw_tokens if t.strip()]
+
+hl_sirets = {t.zfill(14)[:14] for t in raw_tokens if len(t) == 14}
+hl_sirens = {t.zfill(9)[:9]   for t in raw_tokens if len(t) == 9}
+
+# Marque les lignes à surligner (par SIRET exact ou par SIREN = tous les établissements du groupe)
+ent["is_highlight"] = ent["siret"].isin(hl_sirets) | ent["siren"].isin(hl_sirens)
+
+# Petit feedback utile
+if hl_sirets or hl_sirens:
+    found_targets = ent.loc[ent["is_highlight"], ["siret", "siren", "nom_affiche", "cp", "commune"]]
+    st.caption(f"🎯 Cibles trouvées dans le filtre courant: {len(found_targets):,}")
+    if len(found_targets) == 0:
+        st.info("Aucune cible trouvée avec les départements/NAF/siège sélectionnés.")
 
     # Diagnostic utile
     ul_vide = ent["nom_ul"].isna() | (ent["nom_ul"].astype(str).str.strip() == "")
@@ -1011,14 +1044,16 @@ if st.session_state.get("go", False):
         if meth_inj is not None and meth_cog is not None:
             st.caption(f"Injection: {0 if meth_inj is None else len(meth_inj):,} | Cogénération: {0 if meth_cog is None else len(meth_cog):,}")
 
-
     # ---------- Carte ----------
     st.subheader("5) Carte")
     m = folium.Map(location=[46.6, 2.4], zoom_start=6, tiles="OpenStreetMap")
-    cluster_ent = MarkerCluster(name="Entreprises").add_to(m)
-
-    for _, r in ent.iterrows():
-        popup = f"""<b>{_norm(r.get('nom_affiche',''))}</b><br>
+    
+    # Clusters
+    cluster_target = MarkerCluster(name="Cibles (rouge)").add_to(m)
+    cluster_ent    = MarkerCluster(name="Entreprises (bleu)").add_to(m)
+    
+    def _popup_from_row(r):
+        return f"""<b>{_norm(r.get('nom_affiche',''))}</b><br>
         {r.get('adresse','') or ''}<br>
         {(r.get('cp','') or '')} {(r.get('commune','') or '')}<br>
         Dép: {r.get('__dep__','')} | SIRET: {r.get('siret','') or ''}<br>
@@ -1027,12 +1062,50 @@ if st.session_state.get("go", False):
         <a href="{r.get('gmaps_point','')}" target="_blank">Google (point)</a> |
         <a href="{r.get('pj_url','')}" target="_blank">PagesJaunes</a> |
         <a href="{r.get('pj_url_qs','')}" target="_blank">PJ (recherche)</a>"""
-        try:
-            folium.Marker([float(r["lat"]), float(r["lon"])],
-                          popup=popup,
-                          icon=folium.Icon(color="blue", icon="briefcase", prefix="fa")).add_to(cluster_ent)
-        except Exception:
+    
+    # Sépare cibles / autres (option pour afficher d'abord les cibles)
+    ent_targets = ent[ent["is_highlight"]].copy()
+    ent_others  = ent[~ent["is_highlight"]].copy()
+    
+    if show_only_targets_first:
+        # On affiche d'abord les cibles (visuellement au-dessus)
+        iter_order = [("targets", ent_targets), ("others", ent_others)]
+    else:
+        iter_order = [("others", ent_others), ("targets", ent_targets)]
+    
+    # Ajout des points
+    bounds_pts = []
+    for kind, df_src in iter_order:
+        if df_src.empty: 
             continue
+        for _, r in df_src.iterrows():
+            try:
+                lat, lon = float(r["lat"]), float(r["lon"])
+            except Exception:
+                continue
+            popup = _popup_from_row(r)
+            if kind == "targets":
+                folium.Marker(
+                    [lat, lon],
+                    popup=popup,
+                    icon=folium.Icon(color="red", icon="star", prefix="fa")
+                ).add_to(cluster_target)
+                if radius_km and radius_km > 0:
+                    folium.Circle(
+                        radius=radius_km * 1000.0,
+                        location=[lat, lon],
+                        color="red",
+                        weight=2,
+                        fill=False,
+                        opacity=0.6
+                    ).add_to(m)
+            else:
+                folium.Marker(
+                    [lat, lon],
+                    popup=popup,
+                    icon=folium.Icon(color="blue", icon="briefcase", prefix="fa")
+                ).add_to(cluster_ent)
+            bounds_pts.append((lat, lon))
     
     # Couches Méthaniseurs depuis Excel (si dispo)
     if want_meth and meth_inj is not None and meth_cog is not None:
@@ -1079,7 +1152,7 @@ if st.session_state.get("go", False):
         "siret","siren","nom_affiche","nom_ul","nom_etab",
         "adresse","cp","commune","naf","lat","lon",
         "__dep__","__source__",
-        "gmaps_fiche","gmaps_point","pj_url","pj_url_qs"
+        "gmaps_fiche","gmaps_point","pj_url","pj_url_qs", "is_highlight" 
     ]
     cols_export = [c for c in cols_export if c in ent.columns]
     csv_bytes = ent[cols_export].to_csv(index=False).encode("utf-8")
