@@ -967,23 +967,23 @@ if st.session_state.get("go", False):
         .fillna(ent["nom_etab"])
     ).fillna("Nom non diffusible")
     
-# --- Normalisation des identifiants cibles ---
-import itertools
-raw_tokens = re.split(r"[\s,;]+", hl_input.strip()) if hl_input else []
-raw_tokens = [re.sub(r"\D", "", t) for t in raw_tokens if t.strip()]
-
-hl_sirets = {t.zfill(14)[:14] for t in raw_tokens if len(t) == 14}
-hl_sirens = {t.zfill(9)[:9]   for t in raw_tokens if len(t) == 9}
-
-# Marque les lignes à surligner (par SIRET exact ou par SIREN = tous les établissements du groupe)
-ent["is_highlight"] = ent["siret"].isin(hl_sirets) | ent["siren"].isin(hl_sirens)
-
-# Petit feedback utile
-if hl_sirets or hl_sirens:
-    found_targets = ent.loc[ent["is_highlight"], ["siret", "siren", "nom_affiche", "cp", "commune"]]
-    st.caption(f"🎯 Cibles trouvées dans le filtre courant: {len(found_targets):,}")
-    if len(found_targets) == 0:
-        st.info("Aucune cible trouvée avec les départements/NAF/siège sélectionnés.")
+    # --- Normalisation des identifiants cibles ---
+    import itertools
+    raw_tokens = re.split(r"[\s,;]+", hl_input.strip()) if hl_input else []
+    raw_tokens = [re.sub(r"\D", "", t) for t in raw_tokens if t.strip()]
+    
+    hl_sirets = {t.zfill(14)[:14] for t in raw_tokens if len(t) == 14}
+    hl_sirens = {t.zfill(9)[:9]   for t in raw_tokens if len(t) == 9}
+    
+    # Marque les lignes à surligner (par SIRET exact ou par SIREN = tous les établissements du groupe)
+    ent["is_highlight"] = ent["siret"].isin(hl_sirets) | ent["siren"].isin(hl_sirens)
+    
+    # Petit feedback utile
+    if hl_sirets or hl_sirens:
+        found_targets = ent.loc[ent["is_highlight"], ["siret", "siren", "nom_affiche", "cp", "commune"]]
+        st.caption(f"🎯 Cibles trouvées dans le filtre courant: {len(found_targets):,}")
+        if len(found_targets) == 0:
+            st.info("Aucune cible trouvée avec les départements/NAF/siège sélectionnés.")
 
     # Diagnostic utile
     ul_vide = ent["nom_ul"].isna() | (ent["nom_ul"].astype(str).str.strip() == "")
