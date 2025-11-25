@@ -354,6 +354,31 @@ def coalesce_name_etab(row):
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
+def _norm_key(s: str) -> str:
+    s = _norm(s or "")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+@st.cache_data(show_spinner=False)
+def build_centroids_from_ent(ent: pd.DataFrame):
+    """
+    Construit des centroïdes à partir des entreprises déjà chargées.
+    Retourne (city_centroids, dep_centroids).
+      - city_centroids: dep, commune_norm, lat, lon
+      - dep_centroids : dep, lat, lon
+    """
+    if ent is None or ent.empty:
+        return (pd.DataFrame(columns=["dep","commune_norm","lat","lon"]),
+                pd.DataFrame(columns=["dep","lat","lon"]))
+
+    df = ent[["__dep__","commune","lat","lon"]].dropna().copy()
+    df["commune_norm"] = df["commune"].astype(str).map(_norm_key)
+
+    city = (df.groupby(["__dep__","commune_norm"])[["lat","lon"]]
+              .median().reset_index().rename(columns={"__dep__":"dep"}))
+    dep  = (df.groupby(["__dep__"])[["lat","lon"]]
+              .median().reset_index().rename(columns={"__dep__":"dep"}))
+    return city, dep
 
 # ==================== FICHIERS DISPONIBLES ====================
 @st.cache_data(show_spinner=False)
@@ -719,10 +744,17 @@ def _dep_from_insee(insee: str) -> str:
     return insee[:2]
 
 @st.cache_data(show_spinner=True)
-def load_meth_from_excel(selected_deps: list[str], uploaded_bytes: bytes | None):
+def load_meth_from_excel(
+    selected_deps: list[str],
+    uploaded_bytes: bytes | None,
+    fallback_city: pd.DataFrame | None = None,
+    fallback_dep: pd.DataFrame | None = None,
+):
     """
-    Lit l'Excel (ou un upload Streamlit) avec onglets 'Injection' et 'Cogeneration',
-    renvoie deux DataFrames (inj, cog) avec lat/lon si centroids dispo.
+    Lit l'Excel ('Injection', 'Cogeneration') et renvoie (df_inj, df_cog, stats).
+    Priorité géocodage:
+      1) communes_centroids.(parquet|csv) si présent
+      2) centroïdes reconstruits via entreprises (fallback_city/fallback_dep)
     """
     # 1) source Excel
     excel_path = _find_meth_excel()
@@ -734,6 +766,95 @@ def load_meth_from_excel(selected_deps: list[str], uploaded_bytes: bytes | None)
         return None, None, {"no_excel": True}
 
     needed_cols = {"Nom","Commune","Type","MES","EPC","Pour en savoir +","Unité","Valeur"}
+
+    def _read_sheet(sheet_name, mode_label):
+        if sheet_name not in xls.sheet_names:
+            return pd.DataFrame()
+        df = pd.read_excel(xls, sheet_name=sheet_name)
+        df.columns = [str(c).strip() for c in df.columns]
+        for c in (needed_cols - set(df.columns)):
+            df[c] = pd.NA
+        df["mode"] = mode_label
+
+        s = df["Commune"].astype(str)
+        insee = s.str.extract(r"(\d{5})")[0].fillna("")
+        name  = s.str.replace(r"^\s*\d{5}\s*", "", regex=True).str.strip()
+        df["insee"] = insee.str.zfill(5).str[:5]
+        df["commune_label"] = name.where(name.ne(""), s)
+        df["dep"] = df["insee"].map(_dep_from_insee)
+        return df
+
+    df_inj = _read_sheet("Injection",   "Injection")
+    df_cog = _read_sheet("Cogeneration","Cogeneration")
+
+    # 2) filtre départements
+    if selected_deps:
+        df_inj = df_inj[df_inj["dep"].isin(selected_deps)].copy()
+        df_cog = df_cog[df_cog["dep"].isin(selected_deps)].copy()
+
+    # 3) géocodage
+    cent = _load_centroids()
+    stats = {
+        "no_excel": False,
+        "centroids_missing": cent is None,
+        "placed_inj": 0, "missing_inj": 0,
+        "placed_cog": 0, "missing_cog": 0,
+        "used_fallback": False,
+    }
+
+    def _apply_gmaps(df_):
+        df_["nom"] = df_["Nom"]
+        df_["gmaps_url"] = df_.apply(lambda r: build_gmaps_point(r.get("lat"), r.get("lon"), r.get("nom")), axis=1)
+        keep = ["nom","commune_label","insee","dep","MES","EPC","Pour en savoir +","Type","Unité","Valeur","mode","lat","lon","gmaps_url"]
+        return df_[keep]
+
+    if cent is not None:
+        # ✅ FIX: il faut assigner le merge
+        for name, df_ in (("inj", df_inj), ("cog", df_cog)):
+            if df_.empty: 
+                continue
+            df_ = df_.merge(cent, on="insee", how="left", copy=False)
+            df_[["lat","lon"]] = df_[["lat","lon"]].apply(pd.to_numeric, errors="coerce")
+            placed = int(df_[["lat","lon"]].notna().all(axis=1).sum())
+            missing = int(len(df_) - placed)
+            stats[f"placed_{name}"] = placed
+            stats[f"missing_{name}"] = missing
+            if name == "inj": df_inj = _apply_gmaps(df_).dropna(subset=["lat","lon"])
+            else:             df_cog = _apply_gmaps(df_).dropna(subset=["lat","lon"])
+        return df_inj, df_cog, stats
+
+    # --- Fallback via entreprises (pas de fichier de centroïdes) ---
+    stats["used_fallback"] = True
+
+    city = fallback_city if fallback_city is not None else pd.DataFrame(columns=["dep","commune_norm","lat","lon"])
+    depc = fallback_dep  if fallback_dep  is not None else pd.DataFrame(columns=["dep","lat","lon"])
+
+    # normalise clés pour match "commune"
+    for name, df_ in (("inj", df_inj), ("cog", df_cog)):
+        if df_.empty:
+            continue
+        df_["commune_norm"] = df_["commune_label"].map(_norm_key)
+
+        # 1) jointure sur (dep, commune_norm)
+        df_ = df_.merge(city, on=["dep","commune_norm"], how="left", suffixes=("","_city"))
+        # 2) pour les manquants, jointure au centroïde de département
+        need_dep = df_[["lat","lon"]].isna().any(axis=1)
+        if need_dep.any() and not depc.empty:
+            df_dep = df_.loc[need_dep].merge(depc, on="dep", how="left", suffixes=("","_dep"))
+            df_.loc[need_dep, "lat"] = df_dep["lat_dep"].values
+            df_.loc[need_dep, "lon"] = df_dep["lon_dep"].values
+
+        df_[["lat","lon"]] = df_[["lat","lon"]].apply(pd.to_numeric, errors="coerce")
+        placed = int(df_[["lat","lon"]].notna().all(axis=1).sum())
+        missing = int(len(df_) - placed)
+        stats[f"placed_{name}"] = placed
+        stats[f"missing_{name}"] = missing
+
+        if name == "inj": df_inj = _apply_gmaps(df_).dropna(subset=["lat","lon"])
+        else:             df_cog = _apply_gmaps(df_).dropna(subset=["lat","lon"])
+
+    return df_inj, df_cog, stats
+
 
     def _read_sheet(sheet_name, mode_label):
         if sheet_name not in xls.sheet_names:
@@ -1031,18 +1152,32 @@ if st.session_state.get("go", False):
     with st.expander("Source Méthaniseurs (Excel 'Injection' / 'Cogeneration')"):
         upl = st.file_uploader("Dépose ici le fichier Excel des méthaniseurs (sinon l'app cherchera data/methaniseurs/methaniseurs.xlsx)", type=["xlsx","xls"])
         want_meth = st.checkbox("Afficher la couche 'Méthaniseurs' (Injection + Cogénération)", value=True)
-    
+
     meth_inj = meth_cog = None
     meth_stats = {"no_excel": False, "centroids_missing": False}
+    
+    # ⬇️ Construire des centroïdes à partir des entreprises chargées (fallback)
+    city_centroids, dep_centroids = build_centroids_from_ent(ent)
+    
     if want_meth:
-        inj, cog, stats = load_meth_from_excel(selected_deps, uploaded_bytes=upl.getvalue() if upl else None)
+        inj, cog, stats = load_meth_from_excel(
+            selected_deps,
+            uploaded_bytes=upl.getvalue() if upl else None,
+            fallback_city=city_centroids,
+            fallback_dep=dep_centroids,
+        )
         meth_inj, meth_cog, meth_stats = inj, cog, stats
+    
         if stats.get("no_excel"):
             st.info("Aucun fichier Excel trouvé (uploader ci-dessus ou place 'data/methaniseurs/methaniseurs.xlsx').")
         if stats.get("centroids_missing"):
-            st.warning("Pas de centroids de communes trouvés (ajoute 'communes_centroids.parquet|csv' avec colonnes insee,lat,lon).")
-        if meth_inj is not None and meth_cog is not None:
-            st.caption(f"Injection: {0 if meth_inj is None else len(meth_inj):,} | Cogénération: {0 if meth_cog is None else len(meth_cog):,}")
+            st.warning("Pas de fichier de centroïdes : fallback via entreprises (commune → médiane des points, sinon médiane du département).")
+        st.caption(
+            f"Injection placés: {stats.get('placed_inj',0):,} (manquants: {stats.get('missing_inj',0):,}) | "
+            f"Cogénération placés: {stats.get('placed_cog',0):,} (manquants: {stats.get('missing_cog',0):,})"
+            + (" — Fallback entreprises actif" if stats.get("used_fallback") else "")
+        )
+    
 
     # ---------- Carte ----------
     st.subheader("5) Carte")
