@@ -780,7 +780,7 @@ naf_from_div = [c for (c, _) in sect_options_unique] if take_all else [c for (c,
 
 # --- Fusion des 3 sources : saisie libre + scan + divisions/secteurs ---
 naf_typed = [canon_naf(c) for c in naf_input.split(",") if c.strip()]
-naf_select_ms = [canon_naf(c) for c in st.session_state["naf_options"] if c]
+naf_select_ms = [canon_naf(c) for c in naf_select_ms if c]
 naf_from_div = [canon_naf(c) for (c, _) in (sect_options_unique if take_all else secteurs_sel)]
 naf_final = sorted(set(naf_typed) | set(naf_select_ms) | set(naf_from_div))
 st.caption(f"🧩 Codes NAF retenus ({len(naf_final)}): {', '.join(naf_final) if naf_final else '—'}")
@@ -1029,4 +1029,3 @@ else:
     st.info("💡 Sélectionne d’abord 1–n départements, saisis (ou scanne) des codes NAF, puis clique *Charger la carte*.")
 
     
-
