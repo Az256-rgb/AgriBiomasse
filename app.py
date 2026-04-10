@@ -492,6 +492,26 @@ def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege:
                     # et on filtrera ensuite en Pandas (plus lent mais robuste).
                     filt = None
 
+            # Filtres "sûrs" côté Arrow pour réduire le volume avant to_pandas()
+            try:
+                arrow_filt = None
+                if COLS["etat"] in dset.schema.names:
+                    f_etat = ds.field(COLS["etat"]).cast(pa.string()).isin(["A", "a", "ACTIF", "Actif"])
+                    arrow_filt = f_etat if arrow_filt is None else (arrow_filt & f_etat)
+                if only_siege and COLS["siege"] in dset.schema.names:
+                    f_siege = ds.field(COLS["siege"]).cast(pa.string()).isin(["1","True","true","O","Oui"])
+                    arrow_filt = f_siege if arrow_filt is None else (arrow_filt & f_siege)
+                if COLS["lat"] in dset.schema.names:
+                    f_lat = ds.field(COLS["lat"]).is_valid()
+                    arrow_filt = f_lat if arrow_filt is None else (arrow_filt & f_lat)
+                if COLS["lon"] in dset.schema.names:
+                    f_lon = ds.field(COLS["lon"]).is_valid()
+                    arrow_filt = f_lon if arrow_filt is None else (arrow_filt & f_lon)
+                if arrow_filt is not None:
+                    filt = arrow_filt if filt is None else (filt & arrow_filt)
+            except Exception:
+                pass
+
             try:
                 tbl = dset.to_table(columns=cols, filter=filt)
                 df = tbl.to_pandas()
