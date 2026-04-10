@@ -780,7 +780,7 @@ naf_from_div = [c for (c, _) in sect_options_unique] if take_all else [c for (c,
 
 # --- Fusion des 3 sources : saisie libre + scan + divisions/secteurs ---
 naf_typed = [canon_naf(c) for c in naf_input.split(",") if c.strip()]
-naf_select_ms = [canon_naf(c) for c in st.session_state["naf_options"] if c]
+naf_select_ms = [canon_naf(c) for c in naf_select_ms if c]
 naf_from_div = [canon_naf(c) for (c, _) in (sect_options_unique if take_all else secteurs_sel)]
 naf_final = sorted(set(naf_typed) | set(naf_select_ms) | set(naf_from_div))
 st.caption(f"🧩 Codes NAF retenus ({len(naf_final)}): {', '.join(naf_final) if naf_final else '—'}")
@@ -937,6 +937,15 @@ if st.session_state.get("go", False):
 
     # ---------- Carte ----------
     st.subheader("5) Carte")
+    MAX_POINTS_MAP = 20_000
+    ent_for_map = ent
+    if len(ent_for_map) > MAX_POINTS_MAP:
+        st.warning(
+            f"⚠️ Volume trop élevé pour la carte ({len(ent_for_map):,} points). "
+            f"Affichage limité aux {MAX_POINTS_MAP:,} premiers points pour éviter un plantage."
+        )
+        ent_for_map = ent_for_map.head(MAX_POINTS_MAP).copy()
+
     m = folium.Map(location=[46.6, 2.4], zoom_start=6, tiles="OpenStreetMap")
     
     # Clusters
@@ -955,8 +964,8 @@ if st.session_state.get("go", False):
         <a href="{r.get('pj_url_qs','')}" target="_blank">PJ (recherche)</a>"""
     
     # Sépare cibles / autres (option pour afficher d'abord les cibles)
-    ent_targets = ent[ent["is_highlight"]].copy()
-    ent_others  = ent[~ent["is_highlight"]].copy()
+    ent_targets = ent_for_map[ent_for_map["is_highlight"]].copy()
+    ent_others  = ent_for_map[~ent_for_map["is_highlight"]].copy()
     
     if show_only_targets_first:
         # On affiche d'abord les cibles (visuellement au-dessus)
@@ -1029,4 +1038,3 @@ else:
     st.info("💡 Sélectionne d’abord 1–n départements, saisis (ou scanne) des codes NAF, puis clique *Charger la carte*.")
 
     
-
