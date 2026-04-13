@@ -329,10 +329,17 @@ def build_pj_links(nom, adresse, cp, commune):
     - URL querystring de secours: ?quoiqui=&ou=
     On renvoie un tuple (pj_pretty, pj_qs).
     """
-    nom = (nom or "").strip()
-    adresse = (adresse or "").strip()
-    cp = (str(cp or "")).strip()
-    commune = (commune or "").strip()
+    def _safe_strip(v):
+        if isinstance(v, str):
+            return v.strip()
+        if pd.isna(v):
+            return ""
+        return str(v).strip()
+
+    nom = _safe_strip(nom)
+    adresse = _safe_strip(adresse)
+    cp = _safe_strip(cp)
+    commune = _safe_strip(commune)
 
     # ville-dept pour slug 'joli' (ex: paris-75, lyon-69)
     dept = cp[:2] if cp else ""
@@ -491,6 +498,26 @@ def load_filtered(selected_deps: list[str], naf_selected: list[str], only_siege:
                     # Si la version de PyArrow ne supporte pas replace_substring_regex → on lira sans filtre
                     # et on filtrera ensuite en Pandas (plus lent mais robuste).
                     filt = None
+
+            # Filtres "sûrs" côté Arrow pour réduire le volume avant to_pandas()
+            try:
+                arrow_filt = None
+                if COLS["etat"] in dset.schema.names:
+                    f_etat = ds.field(COLS["etat"]).cast(pa.string()).isin(["A", "a", "ACTIF", "Actif"])
+                    arrow_filt = f_etat if arrow_filt is None else (arrow_filt & f_etat)
+                if only_siege and COLS["siege"] in dset.schema.names:
+                    f_siege = ds.field(COLS["siege"]).cast(pa.string()).isin(["1","True","true","O","Oui"])
+                    arrow_filt = f_siege if arrow_filt is None else (arrow_filt & f_siege)
+                if COLS["lat"] in dset.schema.names:
+                    f_lat = ds.field(COLS["lat"]).is_valid()
+                    arrow_filt = f_lat if arrow_filt is None else (arrow_filt & f_lat)
+                if COLS["lon"] in dset.schema.names:
+                    f_lon = ds.field(COLS["lon"]).is_valid()
+                    arrow_filt = f_lon if arrow_filt is None else (arrow_filt & f_lon)
+                if arrow_filt is not None:
+                    filt = arrow_filt if filt is None else (filt & arrow_filt)
+            except Exception:
+                pass
 
             try:
                 tbl = dset.to_table(columns=cols, filter=filt)
@@ -780,7 +807,7 @@ naf_from_div = [c for (c, _) in sect_options_unique] if take_all else [c for (c,
 
 # --- Fusion des 3 sources : saisie libre + scan + divisions/secteurs ---
 naf_typed = [canon_naf(c) for c in naf_input.split(",") if c.strip()]
-naf_select_ms = [canon_naf(c) for c in st.session_state["naf_options"] if c]
+naf_select_ms = [canon_naf(c) for c in naf_select_ms if c]
 naf_from_div = [canon_naf(c) for (c, _) in (sect_options_unique if take_all else secteurs_sel)]
 naf_final = sorted(set(naf_typed) | set(naf_select_ms) | set(naf_from_div))
 st.caption(f"🧩 Codes NAF retenus ({len(naf_final)}): {', '.join(naf_final) if naf_final else '—'}")
@@ -937,6 +964,15 @@ if st.session_state.get("go", False):
 
     # ---------- Carte ----------
     st.subheader("5) Carte")
+    MAX_POINTS_MAP = 20_000
+    ent_for_map = ent
+    if len(ent_for_map) > MAX_POINTS_MAP:
+        st.warning(
+            f"⚠️ Volume trop élevé pour la carte ({len(ent_for_map):,} points). "
+            f"Affichage limité aux {MAX_POINTS_MAP:,} premiers points pour éviter un plantage."
+        )
+        ent_for_map = ent_for_map.head(MAX_POINTS_MAP).copy()
+
     m = folium.Map(location=[46.6, 2.4], zoom_start=6, tiles="OpenStreetMap")
     
     # Clusters
@@ -955,8 +991,8 @@ if st.session_state.get("go", False):
         <a href="{r.get('pj_url_qs','')}" target="_blank">PJ (recherche)</a>"""
     
     # Sépare cibles / autres (option pour afficher d'abord les cibles)
-    ent_targets = ent[ent["is_highlight"]].copy()
-    ent_others  = ent[~ent["is_highlight"]].copy()
+    ent_targets = ent_for_map[ent_for_map["is_highlight"]].copy()
+    ent_others  = ent_for_map[~ent_for_map["is_highlight"]].copy()
     
     if show_only_targets_first:
         # On affiche d'abord les cibles (visuellement au-dessus)
@@ -1029,4 +1065,3 @@ else:
     st.info("💡 Sélectionne d’abord 1–n départements, saisis (ou scanne) des codes NAF, puis clique *Charger la carte*.")
 
     
-
