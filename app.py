@@ -329,10 +329,17 @@ def build_pj_links(nom, adresse, cp, commune):
     - URL querystring de secours: ?quoiqui=&ou=
     On renvoie un tuple (pj_pretty, pj_qs).
     """
-    nom = (nom or "").strip()
-    adresse = (adresse or "").strip()
-    cp = (str(cp or "")).strip()
-    commune = (commune or "").strip()
+    def _safe_strip(v):
+        if isinstance(v, str):
+            return v.strip()
+        if pd.isna(v):
+            return ""
+        return str(v).strip()
+
+    nom = _safe_strip(nom)
+    adresse = _safe_strip(adresse)
+    cp = _safe_strip(cp)
+    commune = _safe_strip(commune)
 
     # ville-dept pour slug 'joli' (ex: paris-75, lyon-69)
     dept = cp[:2] if cp else ""
